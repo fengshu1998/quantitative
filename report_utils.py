@@ -41,6 +41,25 @@ def _backtest_rows(backtest_report):
     ]
 
 
+def _alpha_factor_selection_rows(alpha_report):
+    rows = []
+    for item in alpha_report.get("factor_selection", []):
+        rows.append(
+            [
+                item.get("factor"),
+                item.get("validity"),
+                item.get("direction"),
+                item.get("weight_level"),
+                item.get("signal_weight"),
+                item.get("rank_ic"),
+                item.get("long_short_return"),
+            ]
+        )
+    if not rows:
+        rows = [["None", "None", "None", "0", "0", "None", "None"]]
+    return rows
+
+
 def build_report_payload(market_summary, messages, agent_outputs, portfolio_result, generated_at):
     qlib_report = getattr(
         portfolio_result,
@@ -201,7 +220,13 @@ def render_markdown_report(payload):
                 ["instrument_count", alpha_report.get("instrument_count")],
                 ["json_path", alpha_report.get("json_path")],
                 ["markdown_path", alpha_report.get("markdown_path")],
+                ["factor_selection_path", alpha_report.get("factor_selection_path")],
             ],
+        ),
+        "### Factor Selection",
+        _markdown_table(
+            ["Factor", "Validity", "Direction", "Weight", "Signal Weight", "RankIC", "Long-Short"],
+            _alpha_factor_selection_rows(alpha_report),
         ),
         "## LLM Explanation",
         f"- Macro: {_safe_text(llm_explanation['macro'])}",

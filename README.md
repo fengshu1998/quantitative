@@ -1,6 +1,6 @@
 # Quantitative Research Pipeline
 
-基于 AkShare + Qlib + TradingAgents 的 A 股量化投研流水线，覆盖 **数据采集 → 因子计算 → 信号生成 → 精选候选 → LLM 多角色研究 → 风控裁剪 → 双重回测 → 报告输出** 的完整闭环。
+基于 AkShare + Qlib + TradingAgents 的 A 股量化投研流水线，覆盖 **数据采集 → 因子计算 → 信号生成 → 精选候选 → LLM 多角色研究 → 风控裁剪 → 双重回测 → Transformer 训练 → Alpha 分析 → 报告输出** 的完整闭环。
 
 ## 架构概览
 
@@ -28,7 +28,17 @@
 │                  │     │                │     │                  │
 └─────────────────┘     │ deterministic  │     │ DeepSeek LLM     │
                         │ + Qlib 专业回测 │     │ 多角色研究        │
-                        └────────────────┘     └──────────────────┘
+                        └────────┬───────┘     └──────────────────┘
+                                 │
+                        ┌────────┴───────┐
+                        │  Meta Research  │
+                        │                 │
+                        │ qlib_training.. │
+                        │ alpha_analysis..│
+                        │                 │
+                        │ Transformer 训练 │
+                        │ Alpha 因子分析   │
+                        └─────────────────┘
 ```
 
 ## 项目结构
@@ -56,6 +66,10 @@ D:\quantitative\
   portfolio_utils.py            # 确定性风控裁剪 + 轻量历史回测
   qlib_backtest_utils.py        # Qlib 专业回测（TopkDropoutStrategy + 基准对比 + 交易成本）
 
+  # 模型训练与 Alpha 研究
+  qlib_training_utils.py        # Transformer 模型训练（Qlib TransformerModel + 因子面板）
+  alpha_analysis_utils.py       # Alpha 因子分析（IC / RankIC / 分层多空 / 相关性 / 缺失率）
+
   # 报告与第三方
   report_utils.py               # JSON + Markdown 日报生成
   tradingagents_adapter.py      # TradingAgents 研究图适配器（DeepSeek LLM）
@@ -69,6 +83,8 @@ D:\quantitative\
   data/fundamentals/            # 财务快照 CSV
   data/industries/              # 行业映射 CSV
   data/qlib/                    # Qlib 二进制数据（日历/标的/特征）
+  data/model_reports/           # Transformer 模型 + 预测 + 训练摘要
+  data/factor_reports/          # Alpha 分析报告（JSON + MD）
   reports/YYYY-MM-DD/           # 每日 JSON + Markdown 报告
   daily_report/                 # 可视化图表 PNG + 汇总 CSV
   third_party/tradingagents/    # TradingAgents 研究图框架
@@ -110,9 +126,24 @@ python main.py（或双击 run.bat）
   │    ├─ build_backtest_report()          ← 本地 CSV 轻量回测
   │    └─ run_qlib_backtest()              ← Qlib TopkDropoutStrategy 专业回测
   │
-  └─ 6. 报告输出
+  ├─ 6. Transformer 训练
+  │    run_transformer_training()
+  │    ├─ ensure_training_factor_data()    ← 确保因子数据扩展到 500 日
+  │    ├─ build_transformer_dataset()      ← 构造 Qlib DatasetH（StaticDataLoader + DataHandlerLP）
+  │    ├─ TransformerModel.fit()           ← Qlib 官方 Transformer（64 维 / 2 层 / 2 头 / 20 epochs）
+  │    ├─ TransformerModel.predict()       ← 测试集预测
+  │    └─ 输出 model / predictions / summary → data/model_reports/
+  │
+  ├─ 7. Alpha 分析
+  │    run_alpha_analysis()
+  │    ├─ _load_alpha_panel()              ← 从 data/factors/*.csv 构造面板
+  │    ├─ _factor_stats()                  ← IC / RankIC / 分层多空收益 / 缺失率
+  │    ├─ _factor_correlation()            ← 因子间 Spearman 相关性矩阵
+  │    └─ 输出 alpha_summary.json + alpha_summary.md → data/factor_reports/
+  │
+  └─ 8. 报告输出
        save_daily_reports()
-       ├─ reports/YYYY-MM-DD/HHMMSS.json  ← 结构化全量数据
+       ├─ reports/YYYY-MM-DD/HHMMSS.json  ← 含 transformer_training_report + alpha_analysis_report
        └─ reports/YYYY-MM-DD/HHMMSS.md    ← Markdown 可读日报
 ```
 
@@ -149,6 +180,71 @@ python main.py（或双击 run.bat）
 - **正向加分**: 趋势上行、正收益、价格高于 MA20、放量、PE 合理、PB 合理、ROE 高、RSI 40–70、MACD 金叉、ADX 强势多头
 - **负向减分**: 趋势下行、负收益、深回撤、高波动、高负债、Bollinger 宽幅、MFI 过热
 - **输出**: signal=BUY (score≥3 且正常) / SELL (score≤-2) / HOLD (其他)
+
+## Transformer 模型训练（qlib_training_utils.py）
+
+### 数据构造
+
+- 从 `data/factors/*.csv` 读取 19 维因子面板（量价 + 技术指标 + ROE + 负债率）
+- 自动扩展到 `TRAINING_LOOKBACK_DAYS = 500` 个交易日（不足时从 akshare 补充）
+- 标签：`forward_return_5d`（未来 5 日收益）
+- 分区：70% train / 15% valid / 15% test（按时间顺序）
+
+### 模型配置
+
+| 参数 | 值 |
+|------|-----|
+| 模型 | Qlib `TransformerModel` |
+| 特征维度 | 19 |
+| 隐层维度 | 64 |
+| 层数 | 2 |
+| 注意力头 | 2 |
+| Epochs | 20（early stop=5） |
+| Batch Size | 2048 |
+| Learning Rate | 1e-4 |
+| Dropout | 0 |
+| 设备 | CUDA 可用时自动 GPU |
+
+### 输出（data/model_reports/）
+
+| 文件 | 内容 |
+|------|------|
+| `transformer_model.pth` | PyTorch 模型权重 |
+| `transformer_predictions.csv` | 测试集预测值 |
+| `transformer_training_summary.json` | 训练摘要（IC / RankIC / MSE） |
+
+### 配置开关
+
+`config.py` → `TRANSFORMER_TRAINING_ENABLED = True/False`
+
+## Alpha 因子分析（alpha_analysis_utils.py）
+
+对 10 个候选因子逐一评估，输出因子表现报告。
+
+### 评估维度
+
+| 指标 | 说明 |
+|------|------|
+| IC | Pearson 相关系数（因子值 vs 未来5日收益） |
+| Rank IC | Spearman 秩相关系数 |
+| 分层多空收益 | 按因子值分5组，多头-空头收益差 |
+| 缺失率 | 因子数据缺失比例 |
+| 因子相关性 | 10x10 Spearman 相关性矩阵 |
+
+### 分析师因子
+
+`return_20d`, `volume_ratio_20d`, `rsi_14`, `macd_diff`, `adx_14`, `bollinger_width`, `volatility_20d`, `max_drawdown_20d`, `roe`, `debt_to_asset`
+
+### 输出（data/factor_reports/）
+
+| 文件 | 内容 |
+|------|------|
+| `alpha_summary.json` | 结构化因子评估报告 |
+| `alpha_summary.md` | Markdown 可读报告 |
+
+### 配置开关
+
+`config.py` → `ALPHA_ANALYSIS_ENABLED = True/False`
 
 ## 研究层
 
@@ -198,7 +294,7 @@ conda activate quant_env
 ### 2. 安装依赖
 
 ```bash
-pip install akshare pandas python-dotenv openai pyqlib
+pip install akshare pandas python-dotenv openai pyqlib torch
 # 可选：高级技术指标
 pip install ta
 # 可选：因子评估
@@ -246,6 +342,8 @@ python data_utils.py       # 拉取行情、计算因子信号、生成候选
 | 风控 | MAX_POSITION_PER_STOCK / MAX_TOTAL_POSITION | 单票上限 10% / 总仓位上限 60% |
 | 过滤 | FILTER_ST / FILTER_SUSPENDED | 过滤 ST 股 / 停牌股 |
 | Qlib | QLIB_ENABLED / QLIB_ACCOUNT / QLIB_BENCHMARK | 回测开关 / 初始资金 100 万 / 基准 SH000300 |
+| Transformer | TRAINING_LOOKBACK_DAYS / TRANSFORMER_TRAINING_ENABLED / TRANSFORMER_LABEL_HORIZON | 训练回溯 500 日 / 训练开关 / 标签前瞻 5 日 |
+| Alpha | ALPHA_ANALYSIS_ENABLED / ALPHA_REPORT_DIR | Alpha 分析开关 / 报告输出目录 |
 
 切换指数示例（沪深300 → 中证500）：
 

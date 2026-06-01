@@ -1,4 +1,12 @@
+import json
+import logging
+
 import pandas as pd
+
+from config import ALPHA_SIGNAL_WEIGHTING_ENABLED, ALPHA_FACTOR_SELECTION_PATH
+
+
+logger = logging.getLogger(__name__)
 
 
 HIGH_VOLATILITY_THRESHOLD = 40.0
@@ -6,6 +14,8 @@ DEEP_DRAWDOWN_THRESHOLD = -10.0
 HIGH_BOLLINGER_WIDTH_THRESHOLD = 25.0
 STRONG_ADX_THRESHOLD = 25.0
 OVERHEATED_MFI_THRESHOLD = 80.0
+
+FACTOR_SELECTION_CACHE = None
 
 
 def _is_missing(value):
@@ -20,6 +30,94 @@ def _as_float(row, column):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _load_factor_selection():
+    global FACTOR_SELECTION_CACHE
+    if FACTOR_SELECTION_CACHE is not None:
+        return FACTOR_SELECTION_CACHE
+    if not ALPHA_SIGNAL_WEIGHTING_ENABLED or not ALPHA_FACTOR_SELECTION_PATH.exists():
+        FACTOR_SELECTION_CACHE = {}
+        return FACTOR_SELECTION_CACHE
+    try:
+        payload = json.loads(ALPHA_FACTOR_SELECTION_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Failed to load alpha factor selection: %s", e)
+        FACTOR_SELECTION_CACHE = {}
+        return FACTOR_SELECTION_CACHE
+
+    FACTOR_SELECTION_CACHE = {
+        item.get("factor"): item
+        for item in payload.get("factor_selection", [])
+        if item.get("factor")
+    }
+    return FACTOR_SELECTION_CACHE
+
+
+def _factor_exposure(row, factor):
+    value = _as_float(row, factor)
+    if value is None:
+        return None
+
+    if factor == "volume_ratio_20d":
+        return value - 1.0
+    if factor == "rsi_14":
+        if 40 <= value <= 70:
+            return 1.0
+        if value < 30 or value > 80:
+            return -1.0
+        return 0.0
+    if factor == "macd_diff":
+        return value
+    if factor == "adx_14":
+        trend = row.get("trend")
+        if trend == "uptrend":
+            return value - STRONG_ADX_THRESHOLD
+        if trend == "downtrend":
+            return STRONG_ADX_THRESHOLD - value
+        return 0.0
+    if factor == "bollinger_width":
+        return value - HIGH_BOLLINGER_WIDTH_THRESHOLD
+    if factor == "volatility_20d":
+        return value - HIGH_VOLATILITY_THRESHOLD
+    if factor == "max_drawdown_20d":
+        return value - DEEP_DRAWDOWN_THRESHOLD
+    if factor == "debt_to_asset":
+        return value - 70.0
+    return value
+
+
+def _apply_alpha_factor_weighting(row, score, reasons):
+    selections = _load_factor_selection()
+    if not selections:
+        return score
+
+    adjustment = 0.0
+    applied = []
+    for factor, meta in selections.items():
+        if meta.get("validity") == "剔除":
+            continue
+        direction = meta.get("direction")
+        if direction not in {"正向", "反向"}:
+            continue
+        weight = float(meta.get("signal_weight") or 0.0)
+        if weight <= 0:
+            continue
+
+        exposure = _factor_exposure(row, factor)
+        if exposure is None or exposure == 0:
+            continue
+
+        aligned = exposure > 0 if direction == "正向" else exposure < 0
+        delta = weight if aligned else -weight
+        adjustment += delta
+        action = "+" if delta > 0 else "-"
+        applied.append(f"alpha {factor} {action}{abs(delta):.2f}")
+
+    if applied:
+        score += adjustment
+        reasons.append("alpha factor weighting: " + ", ".join(applied))
+    return score
 
 
 def _score_row(row):
@@ -115,6 +213,8 @@ def _score_row(row):
     if mfi_14 is not None and mfi_14 >= OVERHEATED_MFI_THRESHOLD:
         score -= 1
         reasons.append("MFI overheated")
+
+    score = _apply_alpha_factor_weighting(row, score, reasons)
 
     if score >= 3 and risk_flag == "normal":
         signal = "BUY"
