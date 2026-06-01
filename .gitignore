@@ -1,0 +1,39 @@
+# Secrets
+environment.env
+*.env
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Generated data & reports
+data/
+reports/
+daily_report/
+
+# Caches
+.cache/
+
+# Model files
+*.pth
+*.pkl
+*.bin
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Downloaded archives (already installed to .claude/)
+buffett-skills-main/
+
+# Jupyter
+.ipynb_checkpoints/
