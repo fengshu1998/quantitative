@@ -32,8 +32,5 @@ daily_report/
 Thumbs.db
 Desktop.ini
 
-# Downloaded archives (already installed to .claude/)
-buffett-skills-main/
-
 # Jupyter
 .ipynb_checkpoints/

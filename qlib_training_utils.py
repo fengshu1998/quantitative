@@ -12,12 +12,15 @@ from config import (
     FACTOR_DATA_DIR,
     TRAINING_LOOKBACK_DAYS,
     TRANSFORMER_LABEL_HORIZON,
+    TRANSFORMER_MODEL_PATH,
     TRANSFORMER_MODEL_DIR,
-    TRANSFORMER_TRAINING_ENABLED,
+    TRANSFORMER_PREDICTION_PATH,
+    TRANSFORMER_INFERENCE_ENABLED,
+    TRANSFORMER_RETRAIN_ON_DAILY_RUN,
 )
 from data_utils import fetch_akshare_data, fetch_index_constituents
 from factor_utils import compute_market_factors
-from qlib_backtest_utils import to_qlib_instrument
+from qlib_backtest_utils import from_qlib_instrument, to_qlib_instrument
 from signal_utils import generate_signal
 from storage_utils import save_dataframe
 
@@ -210,20 +213,50 @@ def _round_or_none(value, digits=6):
     return round(float(value), digits)
 
 
+def _create_transformer_model(torch, feature_count: int):
+    from qlib.contrib.model.pytorch_transformer import TransformerModel
+
+    return TransformerModel(
+        d_feat=feature_count,
+        d_model=64,
+        batch_size=2048,
+        nhead=2,
+        num_layers=2,
+        dropout=0.0,
+        n_epochs=20,
+        lr=0.0001,
+        early_stop=5,
+        GPU=0 if torch.cuda.is_available() else -1,
+        seed=42,
+    )
+
+
 def save_transformer_predictions(pred: pd.Series) -> Path:
     TRANSFORMER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    path = TRANSFORMER_MODEL_DIR / "transformer_predictions.csv"
+    path = TRANSFORMER_PREDICTION_PATH
     out = pred.rename("prediction").reset_index()
+    rename_map = {}
+    if "datetime" in out.columns:
+        rename_map["datetime"] = "date"
+    if "instrument" in out.columns:
+        rename_map["instrument"] = "symbol"
+    out = out.rename(columns=rename_map)
+    if "symbol" in out.columns:
+        out["symbol"] = out["symbol"].map(from_qlib_instrument)
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date.astype(str)
+    out["prediction_rank"] = out.groupby("date")["prediction"].rank(ascending=False, method="first") if "date" in out.columns else out["prediction"].rank(ascending=False, method="first")
+    std = out["prediction"].std()
+    out["prediction_zscore"] = 0.0 if std == 0 or pd.isna(std) else (out["prediction"] - out["prediction"].mean()) / std
     out.to_csv(path, index=False, encoding="utf-8-sig")
     return path
 
 
-def run_transformer_training() -> dict[str, Any]:
-    if not TRANSFORMER_TRAINING_ENABLED:
-        return {"status": "skipped", "reason": "TRANSFORMER_TRAINING_ENABLED is False"}
+def run_transformer_training(force: bool = False) -> dict[str, Any]:
+    if not force and not TRANSFORMER_RETRAIN_ON_DAILY_RUN:
+        return {"status": "skipped", "reason": "TRANSFORMER_RETRAIN_ON_DAILY_RUN is False"}
 
     try:
-        from qlib.contrib.model.pytorch_transformer import TransformerModel
         import torch
     except Exception as e:
         return {"status": "skipped", "reason": f"Transformer dependencies unavailable: {e}"}
@@ -235,38 +268,21 @@ def run_transformer_training() -> dict[str, Any]:
         return dataset_info
 
     TRANSFORMER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    model_path = TRANSFORMER_MODEL_DIR / "transformer_model.pth"
+    model_path = TRANSFORMER_MODEL_PATH
     summary_path = TRANSFORMER_MODEL_DIR / "transformer_training_summary.json"
 
     try:
-        model = TransformerModel(
-            d_feat=len(FEATURE_COLUMNS),
-            d_model=64,
-            batch_size=2048,
-            nhead=2,
-            num_layers=2,
-            dropout=0.0,
-            n_epochs=20,
-            lr=0.0001,
-            early_stop=5,
-            GPU=0 if torch.cuda.is_available() else -1,
-            seed=42,
-        )
+        model = _create_transformer_model(torch, len(FEATURE_COLUMNS))
         evals_result = {}
         model.fit(dataset, evals_result=evals_result, save_path=str(model_path))
-        pred = model.predict(dataset, segment="test")
-        pred_path = save_transformer_predictions(pred)
-        metrics = _prediction_metrics(pred, dataset)
         report = {
             "status": "ok",
             "model": "Qlib TransformerModel",
             "device": "cuda:0" if torch.cuda.is_available() else "cpu",
             "model_path": str(model_path),
-            "prediction_path": str(pred_path),
             "summary_path": str(summary_path),
             "data_info": data_info,
             "dataset": dataset_info,
-            "metrics": metrics,
             "evals_result": evals_result,
         }
     except Exception as e:
@@ -279,4 +295,51 @@ def run_transformer_training() -> dict[str, Any]:
         }
 
     summary_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report
+
+
+def run_transformer_inference() -> dict[str, Any]:
+    if not TRANSFORMER_INFERENCE_ENABLED:
+        return {"status": "skipped", "reason": "TRANSFORMER_INFERENCE_ENABLED is False"}
+    if not TRANSFORMER_MODEL_PATH.exists():
+        return {"status": "skipped", "reason": f"model file not found: {TRANSFORMER_MODEL_PATH}"}
+
+    try:
+        import torch
+    except Exception as e:
+        return {"status": "skipped", "reason": f"Transformer dependencies unavailable: {e}"}
+
+    dataset, dataset_info = build_transformer_dataset()
+    if dataset is None:
+        return dataset_info
+
+    try:
+        model = _create_transformer_model(torch, len(FEATURE_COLUMNS))
+        if not hasattr(model, "load"):
+            return {"status": "skipped", "reason": "Qlib TransformerModel does not expose load() in this environment"}
+        model.load(str(TRANSFORMER_MODEL_PATH))
+        pred = model.predict(dataset, segment="test")
+        pred_path = save_transformer_predictions(pred)
+        metrics = _prediction_metrics(pred, dataset)
+        report = {
+            "status": "ok",
+            "model": "Qlib TransformerModel",
+            "model_path": str(TRANSFORMER_MODEL_PATH),
+            "prediction_path": str(pred_path),
+            "dataset": dataset_info,
+            "metrics": metrics,
+        }
+    except Exception as e:
+        logger.exception("Transformer inference failed: %s", e)
+        report = {
+            "status": "failed",
+            "reason": str(e),
+            "model_path": str(TRANSFORMER_MODEL_PATH),
+            "dataset": dataset_info,
+        }
+
+    inference_path = TRANSFORMER_MODEL_DIR / "transformer_inference_summary.json"
+    TRANSFORMER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    inference_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    report["summary_path"] = str(inference_path)
     return report

@@ -1,6 +1,6 @@
 # Quantitative Research Pipeline
 
-基于 AkShare + Qlib + TradingAgents 的 A 股量化投研流水线，覆盖 **数据采集 → 因子计算 → 信号生成 → 精选候选 → LLM 多角色研究 → 风控裁剪 → 双重回测 → Transformer 训练 → Alpha 分析 → 报告输出** 的完整闭环。
+基于 AkShare + Qlib + TradingAgents 的 A 股量化投研流水线，覆盖 **数据采集 → 因子计算 → 信号生成 → 精选候选 → LLM 多角色研究 → 风控裁剪 → 双重回测 → Transformer 推理 → Alpha 分析 → 报告输出** 的完整闭环。
 
 ## 架构概览
 
@@ -36,7 +36,7 @@
                         │ qlib_training.. │
                         │ alpha_analysis..│
                         │                 │
-                        │ Transformer 训练 │
+                        │ Transformer 推理 │
                         │ Alpha 因子分析   │
                         └─────────────────┘
 ```
@@ -126,13 +126,11 @@ python main.py（或双击 run.bat）
   │    ├─ build_backtest_report()          ← 本地 CSV 轻量回测
   │    └─ run_qlib_backtest()              ← Qlib TopkDropoutStrategy 专业回测
   │
-  ├─ 6. Transformer 训练
-  │    run_transformer_training()
-  │    ├─ ensure_training_factor_data()    ← 确保因子数据扩展到 500 日
-  │    ├─ build_transformer_dataset()      ← 构造 Qlib DatasetH（StaticDataLoader + DataHandlerLP）
-  │    ├─ TransformerModel.fit()           ← Qlib 官方 Transformer（64 维 / 2 层 / 2 头 / 20 epochs）
+  ├─ 6. Transformer 每日推理
+  │    run_transformer_inference()
+  │    ├─ 加载已有 transformer_model.pth
   │    ├─ TransformerModel.predict()       ← 测试集预测
-  │    └─ 输出 model / predictions / summary → data/model_reports/
+  │    └─ 输出 predictions / inference summary → data/model_reports/
   │
   ├─ 7. Alpha 分析
   │    run_alpha_analysis()
@@ -185,7 +183,10 @@ python main.py（或双击 run.bat）
 
 ### 数据构造
 
-- 从 `data/factors/*.csv` 读取 19 维因子面板（量价 + 技术指标 + ROE + 负债率）
+- 从 `data/factors/*.csv` 读取 20 维因子面板：
+  - 量价（7）：return_1d / return_5d / return_20d / volatility_20d / max_drawdown_20d / price_vs_ma20 / volume_ratio_20d
+  - 技术指标（11）：rsi_14 / macd / macd_signal / macd_diff / bollinger_width / atr_14 / stoch_k / stoch_d / mfi_14 / adx_14 / cci_20
+  - 基本面（2）：roe / debt_to_asset
 - 自动扩展到 `TRAINING_LOOKBACK_DAYS = 500` 个交易日（不足时从 akshare 补充）
 - 标签：`forward_return_5d`（未来 5 日收益）
 - 分区：70% train / 15% valid / 15% test（按时间顺序）
@@ -195,7 +196,7 @@ python main.py（或双击 run.bat）
 | 参数 | 值 |
 |------|-----|
 | 模型 | Qlib `TransformerModel` |
-| 特征维度 | 19 |
+| 特征维度 | 20 |
 | 隐层维度 | 64 |
 | 层数 | 2 |
 | 注意力头 | 2 |
@@ -215,7 +216,16 @@ python main.py（或双击 run.bat）
 
 ### 配置开关
 
-`config.py` → `TRANSFORMER_TRAINING_ENABLED = True/False`
+`config.py`：
+
+- `TRANSFORMER_RETRAIN_ON_DAILY_RUN = False`：日报默认不重训，只保留已有训练产物。
+- `TRANSFORMER_INFERENCE_ENABLED = True`：日报默认加载已有 `transformer_model.pth` 做每日预测。
+
+手动、周度或月度重训时可单独调用：
+
+```bash
+python -c "from qlib_training_utils import run_transformer_training; print(run_transformer_training(force=True))"
+```
 
 ## Alpha 因子分析（alpha_analysis_utils.py）
 
@@ -342,7 +352,7 @@ python data_utils.py       # 拉取行情、计算因子信号、生成候选
 | 风控 | MAX_POSITION_PER_STOCK / MAX_TOTAL_POSITION | 单票上限 10% / 总仓位上限 60% |
 | 过滤 | FILTER_ST / FILTER_SUSPENDED | 过滤 ST 股 / 停牌股 |
 | Qlib | QLIB_ENABLED / QLIB_ACCOUNT / QLIB_BENCHMARK | 回测开关 / 初始资金 100 万 / 基准 SH000300 |
-| Transformer | TRAINING_LOOKBACK_DAYS / TRANSFORMER_TRAINING_ENABLED / TRANSFORMER_LABEL_HORIZON | 训练回溯 500 日 / 训练开关 / 标签前瞻 5 日 |
+| Transformer | TRAINING_LOOKBACK_DAYS / TRANSFORMER_RETRAIN_ON_DAILY_RUN / TRANSFORMER_INFERENCE_ENABLED / TRANSFORMER_LABEL_HORIZON | 训练回溯 500 日 / 日报是否重训 / 推理开关 / 标签前瞻 5 日 |
 | Alpha | ALPHA_ANALYSIS_ENABLED / ALPHA_REPORT_DIR | Alpha 分析开关 / 报告输出目录 |
 
 切换指数示例（沪深300 → 中证500）：

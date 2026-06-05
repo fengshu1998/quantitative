@@ -39,6 +39,13 @@ def _pick_first(row: pd.Series, columns: list[str]):
     return None
 
 
+def _pick_row_by_code(df: pd.DataFrame, code: str) -> pd.DataFrame:
+    for column in ["symbol", "代码", "证券代码"]:
+        if column in df.columns:
+            return df[df[column].astype(str).str.zfill(6) == code]
+    return pd.DataFrame()
+
+
 def _empty_snapshot(symbol: str) -> dict:
     return {
         "symbol": symbol,
@@ -60,14 +67,14 @@ def fetch_fundamental_data(symbol: str, spot_df: pd.DataFrame | None = None) -> 
     code = _plain_code(symbol)
 
     try:
-        if spot_df is not None and not spot_df.empty and "代码" in spot_df.columns:
-            row_df = spot_df[spot_df["代码"].astype(str).str.zfill(6) == code]
+        if spot_df is not None and not spot_df.empty:
+            row_df = _pick_row_by_code(spot_df, code)
             if not row_df.empty:
                 row = row_df.iloc[0]
-                snapshot["pe"] = _pick_first(row, ["市盈率-动态", "市盈率", "PE"])
-                snapshot["pb"] = _pick_first(row, ["市净率", "PB"])
-                snapshot["total_market_cap"] = _pick_first(row, ["总市值"])
-                snapshot["float_market_cap"] = _pick_first(row, ["流通市值"])
+                snapshot["pe"] = _pick_first(row, ["pe", "市盈率-动态", "市盈率", "PE"])
+                snapshot["pb"] = _pick_first(row, ["pb", "市净率", "PB"])
+                snapshot["total_market_cap"] = _pick_first(row, ["total_market_cap", "总市值"])
+                snapshot["float_market_cap"] = _pick_first(row, ["float_market_cap", "流通市值"])
     except Exception as e:
         logger.warning("提取实时估值失败 %s: %s", symbol, e)
 

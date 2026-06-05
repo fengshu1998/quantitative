@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +19,11 @@ from config import (
     QLIB_ENABLED,
     QLIB_MIN_COST,
     QLIB_OPEN_COST,
+    QLIB_BACKTEST_COMPARISON_PATH,
     QLIB_PROVIDER_URI,
+    QLIB_REPORT_DIR,
     TOP_N,
+    TRANSFORMER_PREDICTION_PATH,
 )
 
 
@@ -198,7 +202,35 @@ def prepare_qlib_data() -> dict[str, Any]:
     }
 
 
-def build_daily_signal_series(window: int = QLIB_BACKTEST_WINDOW) -> pd.Series:
+def _transformer_prediction_series() -> pd.Series:
+    if not TRANSFORMER_PREDICTION_PATH.exists():
+        return pd.Series(dtype=float, name="score")
+    try:
+        pred = pd.read_csv(TRANSFORMER_PREDICTION_PATH)
+    except Exception as e:
+        logger.warning("Failed to read transformer predictions: %s", e)
+        return pd.Series(dtype=float, name="score")
+    if pred.empty or "prediction" not in pred.columns:
+        return pd.Series(dtype=float, name="score")
+    if {"date", "symbol"}.issubset(pred.columns):
+        pred["datetime"] = pd.to_datetime(pred["date"], errors="coerce")
+        pred["instrument"] = pred["symbol"].map(to_qlib_instrument)
+    elif {"datetime", "instrument"}.issubset(pred.columns):
+        # Backward compatibility for predictions generated before the stable
+        # date/symbol/prediction_rank/prediction_zscore schema was introduced.
+        pred["datetime"] = pd.to_datetime(pred["datetime"], errors="coerce")
+        pred["instrument"] = pred["instrument"].astype(str).str.upper()
+    else:
+        return pd.Series(dtype=float, name="score")
+    pred = pred.dropna(subset=["datetime"])
+    return pd.Series(
+        pd.to_numeric(pred["prediction"], errors="coerce").fillna(LOW_SIGNAL_SCORE).to_numpy(),
+        index=pd.MultiIndex.from_frame(pred[["instrument", "datetime"]]),
+        name="score",
+    ).sort_index()
+
+
+def build_daily_signal_series(window: int = QLIB_BACKTEST_WINDOW, signal_source: str = "rule") -> pd.Series:
     frames = _read_factor_files()
     records = []
     for instrument, df in frames.items():
@@ -210,13 +242,13 @@ def build_daily_signal_series(window: int = QLIB_BACKTEST_WINDOW) -> pd.Series:
             df.get("signal", pd.Series(index=df.index, dtype=object)).astype(str).str.upper().eq("BUY")
             & df.get("risk_flag", pd.Series(index=df.index, dtype=object)).astype(str).eq("normal")
         )
-        scores = pd.to_numeric(df["signal_score"], errors="coerce").where(signal_ok, LOW_SIGNAL_SCORE)
-        for trade_date, score in zip(df["date"], scores):
+        rule_scores = pd.to_numeric(df["signal_score"], errors="coerce").where(signal_ok, LOW_SIGNAL_SCORE)
+        for trade_date, score in zip(df["date"], rule_scores):
             records.append((instrument, pd.Timestamp(trade_date), float(score)))
 
     if not records:
         return pd.Series(dtype=float, name="score")
-    signal = pd.Series(
+    rule_signal = pd.Series(
         [item[2] for item in records],
         index=pd.MultiIndex.from_tuples(
             [(item[0], item[1]) for item in records],
@@ -224,7 +256,28 @@ def build_daily_signal_series(window: int = QLIB_BACKTEST_WINDOW) -> pd.Series:
         ),
         name="score",
     ).sort_index()
-    return signal
+    if signal_source == "rule":
+        return rule_signal
+
+    transformer_signal = _transformer_prediction_series()
+    if transformer_signal.empty:
+        return pd.Series(dtype=float, name="score")
+    if signal_source == "transformer":
+        return transformer_signal
+    if signal_source == "hybrid":
+        combined = pd.concat(
+            [rule_signal.rename("rule"), transformer_signal.rename("transformer")],
+            axis=1,
+        ).dropna()
+        if combined.empty:
+            return pd.Series(dtype=float, name="score")
+        rule = combined["rule"].where(combined["rule"] > LOW_SIGNAL_SCORE / 2, np.nan)
+        rule_z = (rule - rule.mean()) / rule.std() if rule.std() and not pd.isna(rule.std()) else rule * 0
+        transformer_z = (combined["transformer"] - combined["transformer"].mean()) / combined["transformer"].std()
+        transformer_z = transformer_z.replace([np.inf, -np.inf], 0).fillna(0)
+        score = (rule_z.fillna(LOW_SIGNAL_SCORE) * 0.6 + transformer_z * 0.4).rename("score")
+        return score.sort_index()
+    raise ValueError(f"Unsupported qlib signal_source: {signal_source}")
 
 
 def _flatten_metric_frame(metric: Any) -> dict[str, Any]:
@@ -438,6 +491,17 @@ def _indicator_to_records(indicators: Any, limit: int = 10) -> list[dict]:
 
 
 def build_qlib_report_rows(qlib_report: dict[str, Any]) -> list[list[Any]]:
+    if qlib_report.get("status") == "ok" and qlib_report.get("engine") == "qlib_comparison":
+        rows = [["mode", "comparison"]]
+        for source, report in qlib_report.get("signal_reports", {}).items():
+            rows.extend(
+                [
+                    [f"{source}_total_return", _fmt_percent(report.get("total_return_percent"))],
+                    [f"{source}_max_drawdown", _fmt_percent(report.get("max_drawdown_percent"))],
+                    [f"{source}_sharpe", report.get("sharpe")],
+                ]
+            )
+        return rows
     if qlib_report.get("status") != "ok":
         return [["status", qlib_report.get("status", "unknown")], ["reason", qlib_report.get("reason", "")]]
     return [
@@ -458,7 +522,15 @@ def _fmt_percent(value):
     return f"{float(value):.2f}%"
 
 
-def run_qlib_backtest() -> dict[str, Any]:
+def _save_qlib_report(report: dict[str, Any]) -> dict[str, Any]:
+    QLIB_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    path = QLIB_BACKTEST_COMPARISON_PATH if report.get("engine") == "qlib_comparison" else QLIB_REPORT_DIR / f"qlib_backtest_{report.get('signal_source', 'rule')}.json"
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    report["report_path"] = str(path)
+    return report
+
+
+def _run_single_qlib_backtest(signal_source: str = "rule") -> dict[str, Any]:
     if not QLIB_ENABLED:
         return {"status": "skipped", "reason": "QLIB_ENABLED is False"}
 
@@ -475,9 +547,9 @@ def run_qlib_backtest() -> dict[str, Any]:
     if data_info.get("status") != "ok":
         return data_info
 
-    signal = build_daily_signal_series()
+    signal = build_daily_signal_series(signal_source=signal_source)
     if signal.empty:
-        return {"status": "skipped", "reason": "empty daily qlib signal"}
+        return {"status": "skipped", "reason": f"empty daily qlib signal for {signal_source}", "signal_source": signal_source}
 
     dates = signal.index.get_level_values("datetime").unique().sort_values()
     if len(dates) < 2:
@@ -519,12 +591,60 @@ def run_qlib_backtest() -> dict[str, Any]:
                 "trade_unit": None,
             },
         )
-        return summarize_qlib_backtest(report, None, indicators, data_info)
+        result = summarize_qlib_backtest(report, None, indicators, data_info)
+        result["signal_source"] = signal_source
+        return _save_qlib_report(result)
     except Exception as e:
         logger.exception("Qlib backtest failed: %s", e)
         return {
             "status": "skipped",
             "reason": str(e),
             "engine": "qlib",
+            "signal_source": signal_source,
             "provider_uri": str(QLIB_PROVIDER_URI),
         }
+
+
+def run_qlib_backtest(signal_source: str = "comparison") -> dict[str, Any]:
+    if signal_source != "comparison":
+        return _run_single_qlib_backtest(signal_source)
+
+    reports = {
+        source: _run_single_qlib_backtest(source)
+        for source in ["rule", "transformer", "hybrid"]
+    }
+    ok_reports = {source: report for source, report in reports.items() if report.get("status") == "ok"}
+    if not ok_reports:
+        return {
+            "status": "skipped",
+            "engine": "qlib_comparison",
+            "reason": "all qlib signal-source backtests skipped",
+            "signal_reports": reports,
+        }
+    report = {
+        "status": "ok",
+        "engine": "qlib_comparison",
+        "signal_reports": reports,
+        "primary_signal_source": "hybrid" if reports.get("hybrid", {}).get("status") == "ok" else "rule",
+    }
+    primary = reports.get(report["primary_signal_source"], {})
+    for key in [
+        "benchmark",
+        "benchmark_source",
+        "backtest_window_days",
+        "start_date",
+        "end_date",
+        "account",
+        "total_return_percent",
+        "annualized_return_percent",
+        "annualized_volatility_percent",
+        "max_drawdown_percent",
+        "sharpe",
+        "turnover_rate",
+        "positions",
+        "trade_records",
+        "benchmark_comparison",
+    ]:
+        if key in primary:
+            report[key] = primary[key]
+    return _save_qlib_report(report)

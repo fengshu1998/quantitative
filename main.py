@@ -1,14 +1,20 @@
 import json
 import logging
 import sys
+import warnings
 from dataclasses import dataclass
+
+# pyqlib 0.9.7 depends on gym (unmaintained since 2022); the RL module imports it
+# but this project only uses backtest/training, so the deprecation warning is noise.
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="gym")
 
 from agents import get_latest_agent_payloads, run_tradingagents_research
 from alpha_analysis_utils import run_alpha_analysis
 from data_utils import get_market_data
+from gm_executor import execute_final_orders
 from portfolio_utils import apply_deterministic_risk_rules, build_backtest_report
 from qlib_backtest_utils import run_qlib_backtest
-from qlib_training_utils import run_transformer_training
+from qlib_training_utils import run_transformer_inference, run_transformer_training
 from report_utils import save_daily_reports
 from schemas import MacroAnalysis, RiskReview, StockRecommendation
 
@@ -42,6 +48,7 @@ class PortfolioResult:
     backtest_report: dict
     qlib_backtest_report: dict
     transformer_training_report: dict
+    transformer_inference_report: dict
     alpha_analysis_report: dict
 
 
@@ -106,14 +113,16 @@ def construct_portfolio(agent_outputs):
         agent_outputs.stocks,
     )
     backtest_report = build_backtest_report(risk_result.final_orders)
-    qlib_backtest_report = run_qlib_backtest()
     transformer_training_report = run_transformer_training()
+    transformer_inference_report = run_transformer_inference()
+    qlib_backtest_report = run_qlib_backtest()
     alpha_analysis_report = run_alpha_analysis()
     return PortfolioResult(
         risk=risk_result,
         backtest_report=backtest_report,
         qlib_backtest_report=qlib_backtest_report,
         transformer_training_report=transformer_training_report,
+        transformer_inference_report=transformer_inference_report,
         alpha_analysis_report=alpha_analysis_report,
     )
 
@@ -127,6 +136,9 @@ def print_portfolio_result(portfolio_result):
 
     logger.info("Transformer 训练研究报告")
     print(json.dumps(portfolio_result.transformer_training_report, ensure_ascii=False, indent=2))
+
+    logger.info("Transformer 推理研究报告")
+    print(json.dumps(portfolio_result.transformer_inference_report, ensure_ascii=False, indent=2))
 
     logger.info("Alpha 分析报告")
     print(json.dumps(portfolio_result.alpha_analysis_report, ensure_ascii=False, indent=2))
@@ -157,6 +169,7 @@ def build_pipeline_result(agent_outputs, portfolio_result, report_files):
         "backtest_report": portfolio_result.backtest_report,
         "qlib_backtest_report": portfolio_result.qlib_backtest_report,
         "transformer_training_report": portfolio_result.transformer_training_report,
+        "transformer_inference_report": portfolio_result.transformer_inference_report,
         "alpha_analysis_report": portfolio_result.alpha_analysis_report,
         "report_files": {
             "json": report_files.json,
@@ -178,7 +191,14 @@ def run_pipeline():
         agent_outputs,
         portfolio_result,
     )
-    return build_pipeline_result(agent_outputs, portfolio_result, report_files)
+
+    # 推送交易指令到掘金仿真/实盘账户
+    execution_report = execute_final_orders(portfolio_result.risk.final_orders)
+    logger.info("掘金执行结果: %s", json.dumps(execution_report, ensure_ascii=False, indent=2))
+
+    pipeline_result = build_pipeline_result(agent_outputs, portfolio_result, report_files)
+    pipeline_result["gm_execution_report"] = execution_report
+    return pipeline_result
 
 
 if __name__ == "__main__":

@@ -3,9 +3,13 @@ import re
 
 import akshare as ak
 import pandas as pd
+import requests
 
 from config import (
     DATA_DIR,
+    DAILY_SIGNAL_SCORES_PATH,
+    EASTMONEY_LIGHTWEIGHT_SPOT_ENABLED,
+    EASTMONEY_REQUEST_TIMEOUT,
     FILTER_ST,
     FILTER_SUSPENDED,
     LOOKBACK_DAYS,
@@ -28,6 +32,18 @@ from storage_utils import save_dataframe, save_selected_candidates
 
 
 logger = logging.getLogger(__name__)
+
+
+EASTMONEY_SPOT_URL = "https://82.push2.eastmoney.com/api/qt/clist/get"
+EASTMONEY_SPOT_FIELDS = "f12,f14,f9,f20,f21,f23"
+EASTMONEY_SPOT_COLUMN_MAP = {
+    "f12": "symbol",
+    "f14": "name",
+    "f9": "pe",
+    "f20": "total_market_cap",
+    "f21": "float_market_cap",
+    "f23": "pb",
+}
 
 
 STANDARD_COLUMNS = {
@@ -181,7 +197,17 @@ def _save_selected_candidates(selected_candidates: list[dict]):
         "industry",
         "signal",
         "signal_score",
+        "base_signal_score",
+        "alpha_adjustment",
+        "market_regime_adjustment",
+        "risk_adjustment",
+        "final_signal_score",
         "target_weight",
+        "base_target_weight",
+        "transformer_weight_adjustment",
+        "transformer_prediction",
+        "transformer_prediction_rank",
+        "transformer_prediction_zscore",
         "return_20d",
         "volatility_20d",
         "max_drawdown_20d",
@@ -210,12 +236,111 @@ def _save_selected_candidates(selected_candidates: list[dict]):
     save_selected_candidates(df)
 
 
-def _fetch_spot_snapshot():
+def _save_daily_signal_scores(all_factor_data: dict):
+    rows = []
+    for symbol, item in all_factor_data.items():
+        df = item.get("data")
+        if df is None or df.empty:
+            continue
+        latest = df.iloc[-1].copy()
+        row = {
+            "date": latest.get("date"),
+            "symbol": symbol,
+            "name": item.get("name"),
+            "signal": latest.get("signal"),
+            "signal_score": latest.get("signal_score"),
+            "base_signal_score": latest.get("base_signal_score"),
+            "alpha_adjustment": latest.get("alpha_adjustment"),
+            "market_regime_adjustment": latest.get("market_regime_adjustment"),
+            "risk_adjustment": latest.get("risk_adjustment"),
+            "final_signal_score": latest.get("final_signal_score"),
+            "risk_flag": latest.get("risk_flag"),
+            "signal_reason": latest.get("signal_reason"),
+        }
+        rows.append(row)
+    DAILY_SIGNAL_SCORES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(DAILY_SIGNAL_SCORES_PATH, index=False, encoding="utf-8-sig")
+
+
+def _eastmoney_spot_params(page: int = 1, page_size: int = 100) -> dict:
+    return {
+        "pn": page,
+        "pz": page_size,
+        "po": 1,
+        "np": 1,
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": 2,
+        "invt": 2,
+        "fid": "f12",
+        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
+        "fields": EASTMONEY_SPOT_FIELDS,
+    }
+
+
+def _eastmoney_session() -> requests.Session:
+    session = requests.Session()
+    session.trust_env = False
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36",
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://quote.eastmoney.com/",
+        }
+    )
+    return session
+
+
+def _fetch_lightweight_eastmoney_spot() -> pd.DataFrame:
+    columns = list(EASTMONEY_SPOT_COLUMN_MAP.values())
+    if not EASTMONEY_LIGHTWEIGHT_SPOT_ENABLED:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+    page_size = 100
     try:
-        return ak.stock_zh_a_spot_em()
+        with _eastmoney_session() as session:
+            response = session.get(
+                EASTMONEY_SPOT_URL,
+                params=_eastmoney_spot_params(page=1, page_size=page_size),
+                timeout=EASTMONEY_REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data") or {}
+            diff = data.get("diff") or []
+            rows.extend(diff)
+
+            total = int(data.get("total") or len(diff))
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            for page in range(2, total_pages + 1):
+                response = session.get(
+                    EASTMONEY_SPOT_URL,
+                    params=_eastmoney_spot_params(page=page, page_size=page_size),
+                    timeout=EASTMONEY_REQUEST_TIMEOUT,
+                )
+                response.raise_for_status()
+                page_payload = response.json()
+                rows.extend((page_payload.get("data") or {}).get("diff") or [])
     except Exception as e:
-        logger.warning("获取 A 股实时估值快照失败，将仅使用财务指标接口: %s", e)
-        return pd.DataFrame()
+        logger.warning(
+            "Lightweight EastMoney valuation snapshot failed; PE/PB/market-cap will be skipped: %s",
+            e,
+        )
+        return pd.DataFrame(columns=columns)
+
+    if not rows:
+        return pd.DataFrame(columns=columns)
+
+    df = pd.DataFrame(rows).rename(columns=EASTMONEY_SPOT_COLUMN_MAP)
+    df = df.reindex(columns=columns)
+    df["symbol"] = df["symbol"].astype(str).str.zfill(6)
+    for column in ["pe", "pb", "total_market_cap", "float_market_cap"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    return df
+
+
+def _fetch_spot_snapshot():
+    return _fetch_lightweight_eastmoney_spot()
 
 
 def _industry_lookup(industry_map: pd.DataFrame) -> dict:
@@ -299,6 +424,7 @@ def get_market_snapshot():
         max_position_per_stock=MAX_POSITION_PER_STOCK,
         max_total_position=MAX_TOTAL_POSITION,
     )
+    _save_daily_signal_scores(all_factor_data)
     _save_selected_candidates(selected_candidates)
 
     stats = {
