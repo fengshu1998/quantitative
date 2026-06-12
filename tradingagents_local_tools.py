@@ -140,7 +140,10 @@ def get_indicators(symbol: str, indicators: str = "", rows: int = 5) -> str:
         "roe",
         "debt_to_asset",
         "signal",
-        "signal_score",
+        "cross_section_score",
+        "alpha_cross_section_score",
+        "transformer_cross_section_score",
+        "risk_liquidity_cross_section_score",
         "signal_reason",
         "risk_flag",
     ]
@@ -294,4 +297,3 @@ def get_insider_transactions(symbol: str) -> str:
             "note": "Insider transaction data is not connected for A-share candidates.",
         }
     )
-

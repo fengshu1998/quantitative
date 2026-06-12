@@ -18,11 +18,12 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from config import (
+    AGENT_PERFORMANCE_FEEDBACK_PATH,
+    AGENT_SIGNAL_DIR,
     ALPHA_FACTOR_SELECTION_PATH,
     DATA_DIR,
     MAX_TOTAL_POSITION,
     QLIB_BACKTEST_COMPARISON_PATH,
-    TOP_N,
     TRADINGAGENTS_CACHE_DIR,
     TRADINGAGENTS_GRAPH_ENABLED,
     TRADINGAGENTS_MAX_DEBATE_ROUNDS,
@@ -108,7 +109,7 @@ def _target_weight_percent(candidate: dict[str, Any]) -> float:
 
 def _limit_candidates(candidates: list[dict]) -> list[dict]:
     if TRADINGAGENTS_RESEARCH_TOP_N is None:
-        return candidates[:TOP_N]
+        return candidates
     return candidates[: int(TRADINGAGENTS_RESEARCH_TOP_N)]
 
 
@@ -195,6 +196,63 @@ def _read_json_file(path: Path) -> dict[str, Any]:
         return {}
 
 
+def _snapshot_date_from_candidates(candidates: list[dict]) -> str:
+    dates = []
+    for candidate in candidates:
+        value = candidate.get("date") or candidate.get("datetime") or candidate.get("trade_date")
+        if value is None:
+            continue
+        parsed = pd.to_datetime(value, errors="coerce")
+        if not pd.isna(parsed):
+            dates.append(pd.Timestamp(parsed))
+    if dates:
+        return max(dates).date().isoformat()
+    return date.today().isoformat()
+
+
+def save_agent_signal_snapshot(
+    stock_recommendations: list[StockRecommendation],
+    agent_results: list[dict[str, Any]] | None = None,
+    candidates: list[dict] | None = None,
+    snapshot_date: str | None = None,
+) -> dict[str, Any]:
+    """Persist final agent-adjusted actions for forward-only Qlib backtests."""
+
+    candidates = candidates or []
+    agent_results = agent_results or []
+    trade_date = snapshot_date or _snapshot_date_from_candidates(candidates)
+    results_by_symbol = {
+        str(result.get("ticker") or result.get("symbol") or "").lower(): result
+        for result in agent_results
+    }
+    signals = []
+    for recommendation in stock_recommendations:
+        symbol = recommendation.stock_code.lower()
+        result = results_by_symbol.get(symbol, {})
+        signals.append(
+            {
+                "date": trade_date,
+                "stock_code": recommendation.stock_code,
+                "action": recommendation.action,
+                "weight": recommendation.weight,
+                "reason": recommendation.reason,
+                "strategy_validation": result.get("strategy_validation"),
+                "strategy_validation_effect": result.get("strategy_validation_effect"),
+            }
+        )
+
+    AGENT_SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
+    path = AGENT_SIGNAL_DIR / f"{trade_date}.json"
+    payload = {
+        "date": trade_date,
+        "generated_at": date.today().isoformat(),
+        "signal_count": len(signals),
+        "signals": signals,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, default=_json_default, indent=2), encoding="utf-8")
+    return {"status": "ok", "path": str(path), "date": trade_date, "signal_count": len(signals)}
+
+
 def _latest_transformer_prediction(symbol: str) -> dict[str, Any]:
     if not TRANSFORMER_PREDICTION_PATH.exists():
         return {}
@@ -256,13 +314,30 @@ TRANSFORMER_RETURN_ADVANTAGE_THRESHOLD = 3.0
 REDUCED_EXPOSURE_MULTIPLIER = 0.5
 
 
+def _valid_report(report: dict[str, Any]) -> bool:
+    return bool(report) and report.get("status") == "ok"
+
+
+def _live_first_report(
+    signal_reports: dict[str, Any],
+    live_key: str,
+    fallback_key: str,
+) -> tuple[dict[str, Any], str]:
+    live = signal_reports.get(live_key) or {}
+    if _valid_report(live):
+        return live, "live_snapshot"
+    fallback = signal_reports.get(fallback_key) or {}
+    return fallback, "walk_forward_fallback"
+
+
 def build_strategy_validation(qlib_comparison: dict[str, Any] | None = None) -> dict[str, Any]:
     if qlib_comparison is None:
         qlib_comparison = _read_json_file(Path(QLIB_BACKTEST_COMPARISON_PATH))
     signal_reports = (qlib_comparison or {}).get("signal_reports") or {}
     rule = signal_reports.get("rule") or {}
-    transformer = signal_reports.get("transformer") or {}
-    hybrid = signal_reports.get("hybrid") or {}
+    transformer, transformer_scope = _live_first_report(signal_reports, "transformer_live", "transformer")
+    hybrid, hybrid_scope = _live_first_report(signal_reports, "hybrid_live", "hybrid")
+    validation_signal_scope = "live_snapshot" if transformer_scope == "live_snapshot" or hybrid_scope == "live_snapshot" else "walk_forward_fallback"
     validation_available = bool(rule)
 
     rule_support = _backtest_support(rule)
@@ -312,8 +387,11 @@ def build_strategy_validation(qlib_comparison: dict[str, Any] | None = None) -> 
         exposure_multiplier = 1.0
 
     reason_parts = [
+        f"validation_signal_scope={validation_signal_scope}",
         f"rule={rule_support}",
         f"transformer={transformer_support}",
+        f"transformer_source={transformer_scope}",
+        f"hybrid_source={hybrid_scope}",
         f"hybrid_improvement={hybrid_improvement}",
         f"benchmark_outperformance={benchmark_outperformance}",
         f"drawdown_warning={drawdown_warning}",
@@ -327,6 +405,9 @@ def build_strategy_validation(qlib_comparison: dict[str, Any] | None = None) -> 
 
     return {
         "validation_available": validation_available,
+        "validation_signal_scope": validation_signal_scope,
+        "transformer_validation_source": transformer_scope,
+        "hybrid_validation_source": hybrid_scope,
         "rule_backtest_support": rule_support,
         "transformer_backtest_support": transformer_support,
         "hybrid_improvement": hybrid_improvement,
@@ -347,6 +428,7 @@ def build_tradingagents_context(market_summary: str, candidate: dict) -> str:
     snapshot = _latest_factor_snapshot(symbol)
     factor_selection = _read_json_file(Path(ALPHA_FACTOR_SELECTION_PATH))
     qlib_comparison = _read_json_file(Path(QLIB_BACKTEST_COMPARISON_PATH))
+    agent_feedback = _read_json_file(Path(AGENT_PERFORMANCE_FEEDBACK_PATH))
     transformer_prediction = _latest_transformer_prediction(symbol)
     strategy_validation = build_strategy_validation(qlib_comparison)
     context = {
@@ -356,6 +438,7 @@ def build_tradingagents_context(market_summary: str, candidate: dict) -> str:
         "alpha_factor_selection": factor_selection,
         "latest_transformer_prediction": transformer_prediction,
         "latest_qlib_backtest_comparison": qlib_comparison,
+        "agent_performance_feedback": agent_feedback,
         "strategy_validation": strategy_validation,
         "data_policy": "Use only local A-share project data returned by tools. News and sentiment may be unavailable.",
     }
@@ -392,6 +475,8 @@ def _create_tool_analyst(llm, name: str, report_key: str, tools: list, system_me
                     "You must explicitly cite strategy_validation fields when they are present: "
                     "rule_backtest_support, transformer_backtest_support, hybrid_improvement, "
                     "benchmark_outperformance, drawdown_warning, and agent_research_conclusion. "
+                    "If agent_performance_feedback is present, treat it as historical performance context "
+                    "for risk discipline only; it must not override strategy_validation or deterministic risk rules. "
                     "Available tools: {tool_names}.\n\n"
                     "{system_message}\n\n"
                     "Current date: {current_date}.\n"
@@ -462,7 +547,7 @@ def _build_graph():
             "market_report",
             market_tools,
             (
-                "Analyze local A-share price action, technical factors, deterministic signal_score, "
+                "Analyze local A-share price action, technical factors, deterministic cross_section_score, "
                 "risk_flag, trend, volatility, drawdown, and target weight. Call get_stock_data, "
                 "get_indicators, and get_verified_market_snapshot before writing the final report."
             ),
@@ -784,7 +869,7 @@ def build_macro_from_candidate_set(
         return MacroAnalysis(
             market_environment="defensive",
             suggested_position=0,
-            reason="No TOP_N candidates are available; keep cash and skip new positions.",
+            reason="No ranked index-enhancement candidates are available; keep cash and skip new positions.",
         )
 
     buy_results = [item for item in agent_results if str(item.get("action")).lower() == "buy"]
@@ -803,7 +888,7 @@ def build_macro_from_candidate_set(
         market_environment=environment,
         suggested_position=round(suggested_position, 2),
         reason=(
-            f"TradingAgents LangGraph analyzed {len(candidates)} TOP_N candidates; "
+            f"TradingAgents LangGraph analyzed {len(candidates)} ranked index-enhancement candidates; "
             f"{len(buy_results)} are buy-rated. Suggested position is capped by deterministic limits."
         ),
     )
@@ -907,6 +992,7 @@ def run_tradingagents_research(market_summary: str) -> list[dict]:
         map_tradingagents_to_stock_recommendation(result, candidate)
         for result, candidate in zip(agent_results, candidates)
     ]
+    agent_signal_snapshot = save_agent_signal_snapshot(stock_recommendations, agent_results, candidates)
     macro = build_macro_from_candidate_set(market_summary, candidates, agent_results)
     risk = build_model_risk_from_agent_results(agent_results)
 
@@ -929,6 +1015,7 @@ def run_tradingagents_research(market_summary: str) -> list[dict]:
         "risk_raw": risk_raw,
         "model_risk": risk,
         "agent_results": agent_results,
+        "agent_signal_snapshot": agent_signal_snapshot,
     }
     return messages
 

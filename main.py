@@ -9,12 +9,14 @@ from dataclasses import dataclass
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="gym")
 
 from agents import get_latest_agent_payloads, run_tradingagents_research
+from agent_feedback_utils import run_agent_feedback_update
 from alpha_analysis_utils import run_alpha_analysis
-from data_utils import get_market_data
+from data_utils import build_market_snapshot_from_factors, refresh_factor_data
 from gm_executor import execute_final_orders
-from portfolio_utils import apply_deterministic_risk_rules, build_backtest_report
+from live_attribution_utils import run_live_attribution_update
+from portfolio_utils import apply_deterministic_risk_rules
 from qlib_backtest_utils import run_qlib_backtest
-from qlib_training_utils import run_transformer_inference, run_transformer_training
+from qlib_training_utils import run_transformer_inference
 from report_utils import save_daily_reports
 from schemas import MacroAnalysis, RiskReview, StockRecommendation
 
@@ -40,16 +42,18 @@ class AgentOutputs:
     stocks: list[StockRecommendation]
     risk_raw: str
     model_risk: RiskReview
+    agent_signal_snapshot: dict
 
 
 @dataclass(frozen=True)
 class PortfolioResult:
     risk: RiskReview
-    backtest_report: dict
     qlib_backtest_report: dict
     transformer_training_report: dict
     transformer_inference_report: dict
     alpha_analysis_report: dict
+    live_attribution_report: dict
+    agent_feedback_report: dict
 
 
 @dataclass(frozen=True)
@@ -58,15 +62,55 @@ class ReportFiles:
     markdown: str
 
 
-def load_market_context():
-    logger.info("正在获取市场数据")
-    market_summary = get_market_data()
+@dataclass(frozen=True)
+class MarketPreparation:
+    market_summary: str
+    alpha_analysis_report: dict
+    transformer_training_report: dict
+    transformer_inference_report: dict
+    live_attribution_report: dict
+
+
+def prepare_market_context():
+    logger.info("读取实盘归因反馈")
+    live_attribution_report = run_live_attribution_update()
+    logger.info("实盘归因反馈: %s", json.dumps(live_attribution_report, ensure_ascii=False, indent=2))
+
+    logger.info("刷新行情、财务和因子数据")
+    refresh_result = refresh_factor_data()
+
+    logger.info("前置 Alpha 分析并生成本轮 factor_selection")
+    alpha_analysis_report = run_alpha_analysis()
+    logger.info("Alpha 分析报告")
+    print(json.dumps(alpha_analysis_report, ensure_ascii=False, indent=2))
+
+    logger.info("Transformer 训练/推理")
+    transformer_training_report = {
+        "status": "skipped",
+        "reason": "daily pipeline does not train Transformer; run live production training offline",
+        "training_mode": "daily_disabled",
+    }
+    transformer_inference_report = run_transformer_inference()
+    logger.info("Transformer 训练研究报告")
+    print(json.dumps(transformer_training_report, ensure_ascii=False, indent=2))
+    logger.info("Transformer 推理研究报告")
+    print(json.dumps(transformer_inference_report, ensure_ascii=False, indent=2))
+
+    logger.info("用最新 Alpha + Transformer 融合信号生成候选池")
+    market_snapshot = build_market_snapshot_from_factors(refresh_result)
+    market_summary = market_snapshot["summary_text"]
     print(market_summary)
-    return market_summary
+    return MarketPreparation(
+        market_summary=market_summary,
+        alpha_analysis_report=alpha_analysis_report,
+        transformer_training_report=transformer_training_report,
+        transformer_inference_report=transformer_inference_report,
+        live_attribution_report=live_attribution_report,
+    )
 
 
 def run_agent_research(market_summary):
-    logger.info("启动 TradingAgents 研究层：TOP_N 候选股 -> 研究图 -> schema 映射")
+    logger.info("启动 TradingAgents 研究层：前20%指数增强候选股 -> 研究图 -> schema 映射")
     return run_tradingagents_research(market_summary)
 
 
@@ -104,33 +148,29 @@ def collect_agent_outputs():
         stocks=stock_results,
         risk_raw=risk_raw,
         model_risk=model_risk_result,
+        agent_signal_snapshot=payloads.get("agent_signal_snapshot", {}),
     )
 
 
-def construct_portfolio(agent_outputs):
+def construct_portfolio(agent_outputs, preparation: MarketPreparation):
     risk_result = apply_deterministic_risk_rules(
         agent_outputs.macro,
         agent_outputs.stocks,
     )
-    backtest_report = build_backtest_report(risk_result.final_orders)
-    transformer_training_report = run_transformer_training()
-    transformer_inference_report = run_transformer_inference()
     qlib_backtest_report = run_qlib_backtest()
-    alpha_analysis_report = run_alpha_analysis()
+    agent_feedback_report = run_agent_feedback_update(qlib_backtest_report)
     return PortfolioResult(
         risk=risk_result,
-        backtest_report=backtest_report,
         qlib_backtest_report=qlib_backtest_report,
-        transformer_training_report=transformer_training_report,
-        transformer_inference_report=transformer_inference_report,
-        alpha_analysis_report=alpha_analysis_report,
+        transformer_training_report=preparation.transformer_training_report,
+        transformer_inference_report=preparation.transformer_inference_report,
+        alpha_analysis_report=preparation.alpha_analysis_report,
+        live_attribution_report=preparation.live_attribution_report,
+        agent_feedback_report=agent_feedback_report,
     )
 
 
 def print_portfolio_result(portfolio_result):
-    logger.info("最小历史复盘报告")
-    print(json.dumps(portfolio_result.backtest_report, ensure_ascii=False, indent=2))
-
     logger.info("Qlib 专业回测报告")
     print(json.dumps(portfolio_result.qlib_backtest_report, ensure_ascii=False, indent=2))
 
@@ -142,6 +182,8 @@ def print_portfolio_result(portfolio_result):
 
     logger.info("Alpha 分析报告")
     print(json.dumps(portfolio_result.alpha_analysis_report, ensure_ascii=False, indent=2))
+    logger.info("Agents Qlib feedback report")
+    print(json.dumps(portfolio_result.agent_feedback_report, ensure_ascii=False, indent=2))
 
     logger.info("确定性风控后的最终交易指令")
     print(portfolio_result.risk.model_dump_json(indent=2))
@@ -166,11 +208,11 @@ def build_pipeline_result(agent_outputs, portfolio_result, report_files):
         "stock": [item.model_dump() for item in agent_outputs.stocks],
         "model_risk": agent_outputs.model_risk.model_dump(),
         "risk": portfolio_result.risk.model_dump(),
-        "backtest_report": portfolio_result.backtest_report,
         "qlib_backtest_report": portfolio_result.qlib_backtest_report,
         "transformer_training_report": portfolio_result.transformer_training_report,
         "transformer_inference_report": portfolio_result.transformer_inference_report,
         "alpha_analysis_report": portfolio_result.alpha_analysis_report,
+        "agent_feedback_report": portfolio_result.agent_feedback_report,
         "report_files": {
             "json": report_files.json,
             "markdown": report_files.markdown,
@@ -179,11 +221,12 @@ def build_pipeline_result(agent_outputs, portfolio_result, report_files):
 
 
 def run_pipeline():
-    market_summary = load_market_context()
+    preparation = prepare_market_context()
+    market_summary = preparation.market_summary
     messages = run_agent_research(market_summary)
     print_conversation_history(messages)
     agent_outputs = collect_agent_outputs()
-    portfolio_result = construct_portfolio(agent_outputs)
+    portfolio_result = construct_portfolio(agent_outputs, preparation)
     print_portfolio_result(portfolio_result)
     report_files = save_report_files(
         market_summary,

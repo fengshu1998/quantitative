@@ -1,9 +1,16 @@
+import json
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
+
+import pandas as pd
 
 
 def _install_external_stubs():
+    sys.modules.setdefault("akshare", types.SimpleNamespace())
+
     dotenv = types.ModuleType("dotenv")
     dotenv.load_dotenv = lambda *args, **kwargs: None
     sys.modules.setdefault("dotenv", dotenv)
@@ -104,6 +111,9 @@ def _install_external_stubs():
 _install_external_stubs()
 
 import tradingagents_graph_runner as runner  # noqa: E402
+import qlib_backtest_utils  # noqa: E402
+import agent_feedback_utils  # noqa: E402
+from schemas import StockRecommendation  # noqa: E402
 
 
 def _report(total_return, sharpe=1.0, excess=1.0, drawdown=5.0):
@@ -116,8 +126,13 @@ def _report(total_return, sharpe=1.0, excess=1.0, drawdown=5.0):
     }
 
 
-def _comparison(rule, transformer, hybrid=None):
-    return {"signal_reports": {"rule": rule, "transformer": transformer, "hybrid": hybrid or {}}}
+def _comparison(rule, transformer, hybrid=None, transformer_live=None, hybrid_live=None):
+    reports = {"rule": rule, "transformer": transformer, "hybrid": hybrid or {}}
+    if transformer_live is not None:
+        reports["transformer_live"] = transformer_live
+    if hybrid_live is not None:
+        reports["hybrid_live"] = hybrid_live
+    return {"signal_reports": reports}
 
 
 class StrategyValidationTest(unittest.TestCase):
@@ -172,6 +187,219 @@ class StrategyValidationTest(unittest.TestCase):
         )
         self.assertEqual(rec.action, "buy")
         self.assertEqual(rec.weight, 10)
+
+    def test_strategy_validation_prefers_live_transformer_reports(self):
+        validation = runner.build_strategy_validation(
+            _comparison(
+                _report(-1, excess=-4),
+                _report(-2),
+                hybrid=_report(-2),
+                transformer_live=_report(5),
+                hybrid_live=_report(6),
+            )
+        )
+
+        self.assertEqual(validation["validation_signal_scope"], "live_snapshot")
+        self.assertEqual(validation["transformer_validation_source"], "live_snapshot")
+        self.assertEqual(validation["hybrid_validation_source"], "live_snapshot")
+        self.assertEqual(validation["agent_research_conclusion"], "cautious")
+        self.assertEqual(validation["exposure_adjustment"], "reduce")
+
+    def test_strategy_validation_falls_back_when_live_skipped(self):
+        validation = runner.build_strategy_validation(
+            _comparison(
+                _report(-1, excess=-4),
+                _report(5),
+                hybrid=_report(5),
+                transformer_live={"status": "skipped", "reason": "not enough snapshots"},
+                hybrid_live={"status": "skipped", "reason": "not enough snapshots"},
+            )
+        )
+
+        self.assertEqual(validation["validation_signal_scope"], "walk_forward_fallback")
+        self.assertEqual(validation["transformer_validation_source"], "walk_forward_fallback")
+        self.assertEqual(validation["hybrid_validation_source"], "walk_forward_fallback")
+        self.assertEqual(validation["agent_research_conclusion"], "cautious")
+
+
+class AgentSignalSnapshotTest(unittest.TestCase):
+    def test_agent_snapshot_persists_final_adjusted_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_dir = runner.AGENT_SIGNAL_DIR
+            runner.AGENT_SIGNAL_DIR = Path(tmp)
+            try:
+                report = runner.save_agent_signal_snapshot(
+                    [
+                        StockRecommendation(
+                            stock_code="sh600000",
+                            action="buy",
+                            weight=5,
+                            reason="reduced exposure",
+                        )
+                    ],
+                    [
+                        {
+                            "ticker": "sh600000",
+                            "strategy_validation": {"agent_research_conclusion": "cautious"},
+                            "strategy_validation_effect": "reduced",
+                        }
+                    ],
+                    snapshot_date="2026-06-08",
+                )
+
+                payload = json.loads(Path(report["path"]).read_text(encoding="utf-8"))
+
+                self.assertEqual(payload["date"], "2026-06-08")
+                self.assertEqual(payload["signals"][0]["stock_code"], "sh600000")
+                self.assertEqual(payload["signals"][0]["action"], "buy")
+                self.assertEqual(payload["signals"][0]["weight"], 5)
+                self.assertEqual(payload["signals"][0]["strategy_validation_effect"], "reduced")
+            finally:
+                runner.AGENT_SIGNAL_DIR = old_dir
+
+    def test_tradingagents_context_includes_agent_feedback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_path = runner.AGENT_PERFORMANCE_FEEDBACK_PATH
+            feedback_path = Path(tmp) / "agent_performance_feedback.json"
+            runner.AGENT_PERFORMANCE_FEEDBACK_PATH = feedback_path
+            feedback_path.write_text(
+                json.dumps({"status": "ok", "agent_excess_vs_hybrid_percent": -1.2}),
+                encoding="utf-8",
+            )
+            try:
+                context = json.loads(runner.build_tradingagents_context("summary", {"symbol": "sh600000"}))
+                self.assertEqual(context["agent_performance_feedback"]["status"], "ok")
+                self.assertEqual(context["agent_performance_feedback"]["agent_excess_vs_hybrid_percent"], -1.2)
+            finally:
+                runner.AGENT_PERFORMANCE_FEEDBACK_PATH = old_path
+
+
+class QlibAgentSignalTest(unittest.TestCase):
+    def test_agent_signal_series_reads_forward_snapshots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_dir = qlib_backtest_utils.AGENT_SIGNAL_DIR
+            qlib_backtest_utils.AGENT_SIGNAL_DIR = Path(tmp)
+            try:
+                for day, action, weight in [
+                    ("2026-06-05", "buy", 5),
+                    ("2026-06-08", "hold", 0),
+                ]:
+                    (Path(tmp) / f"{day}.json").write_text(
+                        json.dumps(
+                            {
+                                "date": day,
+                                "signals": [
+                                    {
+                                        "stock_code": "sh600000",
+                                        "action": action,
+                                        "weight": weight,
+                                        "reason": "test",
+                                    }
+                                ],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+
+                signal = qlib_backtest_utils.build_daily_signal_series(signal_source="agents")
+
+                self.assertEqual(float(signal.loc[("SH600000", pd.Timestamp("2026-06-05"))]), 5.0)
+                self.assertEqual(
+                    float(signal.loc[("SH600000", pd.Timestamp("2026-06-08"))]),
+                    qlib_backtest_utils.LOW_SIGNAL_SCORE,
+                )
+            finally:
+                qlib_backtest_utils.AGENT_SIGNAL_DIR = old_dir
+
+    def test_agent_signal_requires_at_least_two_snapshot_dates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_dir = qlib_backtest_utils.AGENT_SIGNAL_DIR
+            qlib_backtest_utils.AGENT_SIGNAL_DIR = Path(tmp)
+            try:
+                (Path(tmp) / "2026-06-08.json").write_text(
+                    json.dumps(
+                        {
+                            "date": "2026-06-08",
+                            "signals": [{"stock_code": "sh600000", "action": "buy", "weight": 5}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                signal = qlib_backtest_utils.build_daily_signal_series(signal_source="agents")
+
+                self.assertTrue(signal.empty)
+            finally:
+                qlib_backtest_utils.AGENT_SIGNAL_DIR = old_dir
+
+    def test_comparison_includes_agents_signal_source(self):
+        old_runner = qlib_backtest_utils._run_single_qlib_backtest
+        seen = []
+        try:
+            def fake_run(source=None, **kwargs):
+                source = source or kwargs.get("signal_source")
+                seen.append(source)
+                return {"status": "ok", "signal_source": source, **kwargs}
+
+            qlib_backtest_utils._run_single_qlib_backtest = fake_run
+            report = qlib_backtest_utils.run_qlib_backtest("comparison")
+
+            self.assertEqual(seen[:6], ["rule", "transformer", "hybrid", "transformer_live", "hybrid_live", "agents"])
+            self.assertIn("agents", report["signal_reports"])
+            self.assertIn("transformer_live", report["signal_reports"])
+            self.assertIn("hybrid_live", report["signal_reports"])
+            self.assertEqual(report["primary_signal_source"], "hybrid_live")
+            self.assertEqual(len(report["rebalance_cost_comparison"]), 9)
+            self.assertIn("rebalance_frequency", report["rebalance_cost_comparison"][0])
+        finally:
+            qlib_backtest_utils._run_single_qlib_backtest = old_runner
+
+
+class AgentFeedbackUtilsTest(unittest.TestCase):
+    def test_feedback_compares_agents_against_hybrid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_path = agent_feedback_utils.AGENT_PERFORMANCE_FEEDBACK_PATH
+            agent_feedback_utils.AGENT_PERFORMANCE_FEEDBACK_PATH = Path(tmp) / "feedback.json"
+            try:
+                feedback = agent_feedback_utils.run_agent_feedback_update(
+                    {
+                        "signal_reports": {
+                            "agents": {
+                                "status": "ok",
+                                "total_return_percent": 2.0,
+                                "max_drawdown_percent": -4.0,
+                                "sharpe": 0.8,
+                            },
+                            "hybrid": {
+                                "status": "ok",
+                                "total_return_percent": 3.5,
+                                "max_drawdown_percent": -3.0,
+                                "sharpe": 1.1,
+                            },
+                        }
+                    }
+                )
+
+                self.assertEqual(feedback["status"], "ok")
+                self.assertEqual(feedback["agent_excess_vs_hybrid_percent"], -1.5)
+                self.assertIn("require_clearer_risk_reward_for_agent_buy", feedback["recommended_constraints"])
+                self.assertTrue(agent_feedback_utils.AGENT_PERFORMANCE_FEEDBACK_PATH.exists())
+            finally:
+                agent_feedback_utils.AGENT_PERFORMANCE_FEEDBACK_PATH = old_path
+
+    def test_feedback_skips_when_agents_backtest_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_path = agent_feedback_utils.AGENT_PERFORMANCE_FEEDBACK_PATH
+            agent_feedback_utils.AGENT_PERFORMANCE_FEEDBACK_PATH = Path(tmp) / "feedback.json"
+            try:
+                feedback = agent_feedback_utils.run_agent_feedback_update(
+                    {"signal_reports": {"agents": {"status": "skipped", "reason": "not enough dates"}}}
+                )
+
+                self.assertEqual(feedback["status"], "skipped")
+                self.assertEqual(feedback["reason"], "not enough dates")
+            finally:
+                agent_feedback_utils.AGENT_PERFORMANCE_FEEDBACK_PATH = old_path
 
 
 if __name__ == "__main__":

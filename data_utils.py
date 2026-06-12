@@ -16,7 +16,6 @@ from config import (
     MAX_POSITION_PER_STOCK,
     MAX_TOTAL_POSITION,
     MIN_REQUIRED_DAYS,
-    TOP_N,
     UNIVERSE_INDEX,
     UNIVERSE_INDEX_SYMBOL,
     UNIVERSE_SIZE_LIMIT,
@@ -26,9 +25,9 @@ from factor_utils import compute_market_factors, merge_fundamental_features
 from fundamental_utils import fetch_fundamental_data, fundamental_snapshot_to_frame
 from industry_utils import fetch_industry_map
 from market_summary_utils import build_market_summary
-from portfolio_selection_utils import allocate_positions, select_top_candidates
-from signal_utils import generate_signal
-from storage_utils import save_dataframe, save_selected_candidates
+from portfolio_selection_utils import allocate_positions, select_ranked_portfolio_candidates
+from signal_utils import apply_cross_sectional_signal_scores, clear_signal_caches, generate_signal
+from storage_utils import load_dataframe, save_dataframe, save_selected_candidates
 
 
 logger = logging.getLogger(__name__)
@@ -196,14 +195,26 @@ def _save_selected_candidates(selected_candidates: list[dict]):
         "name",
         "industry",
         "signal",
-        "signal_score",
+        "cross_section_score",
+        "alpha_cross_section_score",
+        "transformer_cross_section_score",
+        "risk_liquidity_cross_section_score",
         "base_signal_score",
+        "alpha_score",
         "alpha_adjustment",
+        "transformer_score",
+        "risk_liquidity_score",
+        "cross_section_rank_pct",
+        "long_bucket",
+        "short_bucket",
         "market_regime_adjustment",
         "risk_adjustment",
-        "final_signal_score",
         "target_weight",
         "base_target_weight",
+        "benchmark_weight",
+        "benchmark_weight_source",
+        "active_tilt",
+        "volatility_weight_adjustment",
         "transformer_weight_adjustment",
         "transformer_prediction",
         "transformer_prediction_rank",
@@ -248,12 +259,23 @@ def _save_daily_signal_scores(all_factor_data: dict):
             "symbol": symbol,
             "name": item.get("name"),
             "signal": latest.get("signal"),
-            "signal_score": latest.get("signal_score"),
+            "cross_section_score": latest.get("cross_section_score"),
+            "alpha_cross_section_score": latest.get("alpha_cross_section_score"),
+            "transformer_cross_section_score": latest.get("transformer_cross_section_score"),
+            "risk_liquidity_cross_section_score": latest.get("risk_liquidity_cross_section_score"),
             "base_signal_score": latest.get("base_signal_score"),
+            "alpha_score": latest.get("alpha_score"),
             "alpha_adjustment": latest.get("alpha_adjustment"),
+            "transformer_score": latest.get("transformer_score"),
+            "transformer_prediction": latest.get("transformer_prediction"),
+            "transformer_prediction_rank": latest.get("transformer_prediction_rank"),
+            "transformer_prediction_zscore": latest.get("transformer_prediction_zscore"),
+            "risk_liquidity_score": latest.get("risk_liquidity_score"),
+            "cross_section_rank_pct": latest.get("cross_section_rank_pct"),
+            "long_bucket": latest.get("long_bucket"),
+            "short_bucket": latest.get("short_bucket"),
             "market_regime_adjustment": latest.get("market_regime_adjustment"),
             "risk_adjustment": latest.get("risk_adjustment"),
-            "final_signal_score": latest.get("final_signal_score"),
             "risk_flag": latest.get("risk_flag"),
             "signal_reason": latest.get("signal_reason"),
         }
@@ -369,8 +391,9 @@ def _process_one_stock(stock: dict, spot_df: pd.DataFrame, industry_by_symbol: d
     fundamental_snapshot = fetch_fundamental_data(symbol, spot_df)
     save_dataframe(fundamental_snapshot_to_frame(fundamental_snapshot), "fundamentals", symbol)
     factor_df = merge_fundamental_features(factor_df, fundamental_snapshot)
+    factor_df["symbol"] = symbol
+    factor_df["name"] = name
     factor_df["industry"] = industry_by_symbol.get(symbol) or "unknown"
-    factor_df = generate_signal(factor_df)
     save_dataframe(factor_df, "factors", symbol)
     return {"name": name, "data": factor_df}, "ok"
 
@@ -380,8 +403,8 @@ def get_market_data():
     return get_market_snapshot()["summary_text"]
 
 
-def get_market_snapshot():
-    """获取指数成分股、生成信号、选股、分配仓位，并返回结构化快照。"""
+def refresh_factor_data() -> dict:
+    """刷新行情、财务和因子数据，但不生成交易信号。"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     constituents = fetch_index_constituents()
@@ -418,43 +441,95 @@ def get_market_snapshot():
             logger.warning("处理股票失败 %s %s: %s", symbol, name, e)
             continue
 
-    selected_candidates = select_top_candidates(all_factor_data, TOP_N)
-    selected_candidates = allocate_positions(
-        selected_candidates,
-        max_position_per_stock=MAX_POSITION_PER_STOCK,
-        max_total_position=MAX_TOTAL_POSITION,
-    )
-    _save_daily_signal_scores(all_factor_data)
-    _save_selected_candidates(selected_candidates)
-
-    stats = {
+    return {
         "universe_count": universe_count,
         "processed_count": len(constituents),
         "fetched_count": fetched_count,
         "filtered_count": filtered_count,
         "failed_count": failed_count,
-        "valid_count": len(all_factor_data),
-        "selected_count": len(selected_candidates),
         "filter_reasons": filter_reasons,
+        "features": all_factor_data,
+    }
+
+
+def _load_factor_data_from_disk() -> dict:
+    all_factor_data = {}
+    for path in sorted((DATA_DIR / "factors").glob("*.csv")):
+        symbol = path.stem
+        try:
+            df = load_dataframe("factors", symbol)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        name = str(df.iloc[-1].get("name") or symbol)
+        all_factor_data[symbol] = {"name": name, "data": df}
+    return all_factor_data
+
+
+def build_market_snapshot_from_factors(refresh_result: dict | None = None) -> dict:
+    """用最新 alpha/transformer 信号融合结果生成候选池和市场摘要。"""
+    clear_signal_caches()
+    refresh_result = refresh_result or {}
+    all_factor_data = refresh_result.get("features") or _load_factor_data_from_disk()
+    scored_factor_data = {}
+
+    for symbol, item in all_factor_data.items():
+        df = item.get("data")
+        if df is None or df.empty:
+            continue
+        try:
+            scored = generate_signal(df)
+            scored_factor_data[symbol] = {**item, "data": scored}
+        except Exception as e:
+            logger.warning("生成融合信号失败 %s: %s", symbol, e)
+
+    scored_factor_data = apply_cross_sectional_signal_scores(scored_factor_data)
+    for symbol, item in scored_factor_data.items():
+        save_dataframe(item["data"], "factors", symbol)
+
+    selected_candidates = select_ranked_portfolio_candidates(scored_factor_data)
+    selected_candidates = allocate_positions(
+        selected_candidates,
+        max_position_per_stock=MAX_POSITION_PER_STOCK,
+        max_total_position=MAX_TOTAL_POSITION,
+    )
+    _save_daily_signal_scores(scored_factor_data)
+    _save_selected_candidates(selected_candidates)
+
+    stats = {
+        "universe_count": refresh_result.get("universe_count", len(scored_factor_data)),
+        "processed_count": refresh_result.get("processed_count", len(scored_factor_data)),
+        "fetched_count": refresh_result.get("fetched_count", len(scored_factor_data)),
+        "filtered_count": refresh_result.get("filtered_count", 0),
+        "failed_count": refresh_result.get("failed_count", 0),
+        "valid_count": len(scored_factor_data),
+        "selected_count": len(selected_candidates),
+        "filter_reasons": refresh_result.get("filter_reasons", {}),
     }
     logger.info(
         "%s成分股数量: %s, 本次处理: %s, 成功拉取: %s, 过滤: %s, 失败: %s, 有效: %s, 最终候选: %s",
         UNIVERSE_INDEX,
-        universe_count,
-        len(constituents),
-        fetched_count,
-        filtered_count,
-        failed_count,
-        len(all_factor_data),
+        stats["universe_count"],
+        stats["processed_count"],
+        stats["fetched_count"],
+        stats["filtered_count"],
+        stats["failed_count"],
+        len(scored_factor_data),
         len(selected_candidates),
     )
 
     return {
-        "summary_text": build_market_summary(all_factor_data, selected_candidates, stats),
-        "features": all_factor_data,
+        "summary_text": build_market_summary(scored_factor_data, selected_candidates, stats),
+        "features": scored_factor_data,
         "selected_candidates": selected_candidates,
         "stats": stats,
     }
+
+
+def get_market_snapshot():
+    """刷新因子，并用当前已有 alpha/transformer 结果生成市场快照。"""
+    return build_market_snapshot_from_factors(refresh_factor_data())
 
 
 

@@ -10,7 +10,9 @@ import numpy as np
 import pandas as pd
 
 from config import (
+    AGENT_SIGNAL_DIR,
     FACTOR_DATA_DIR,
+    LONG_QUANTILE,
     MAX_TOTAL_POSITION,
     QLIB_ACCOUNT,
     QLIB_BACKTEST_WINDOW,
@@ -22,8 +24,11 @@ from config import (
     QLIB_BACKTEST_COMPARISON_PATH,
     QLIB_PROVIDER_URI,
     QLIB_REPORT_DIR,
-    TOP_N,
     TRANSFORMER_PREDICTION_PATH,
+    TRANSFORMER_LIVE_MIN_SNAPSHOT_DAYS,
+    TRANSFORMER_LIVE_PREDICTION_DIR,
+    TRANSFORMER_WALK_FORWARD_ENABLED,
+    TRANSFORMER_WALK_FORWARD_PREDICTION_PATH,
 )
 
 
@@ -31,6 +36,13 @@ logger = logging.getLogger(__name__)
 
 LOW_SIGNAL_SCORE = -1_000_000.0
 REQUIRED_PRICE_FIELDS = ["open", "high", "low", "close", "volume"]
+LAST_TRANSFORMER_SIGNAL_METADATA: dict[str, Any] = {}
+QLIB_COST_PROFILES = {
+    "low": {"open_cost": 0.0002, "close_cost": 0.0007, "min_cost": QLIB_MIN_COST},
+    "current": {"open_cost": QLIB_OPEN_COST, "close_cost": QLIB_CLOSE_COST, "min_cost": QLIB_MIN_COST},
+    "high": {"open_cost": 0.0010, "close_cost": 0.0025, "min_cost": QLIB_MIN_COST},
+}
+QLIB_REBALANCE_FREQUENCIES = ["daily", "weekly", "monthly"]
 
 
 def to_qlib_instrument(symbol: str) -> str:
@@ -202,16 +214,46 @@ def prepare_qlib_data() -> dict[str, Any]:
     }
 
 
+def _select_transformer_prediction_file() -> tuple[Path, str]:
+    if TRANSFORMER_WALK_FORWARD_ENABLED and TRANSFORMER_WALK_FORWARD_PREDICTION_PATH.exists():
+        return TRANSFORMER_WALK_FORWARD_PREDICTION_PATH, "walk_forward"
+    return TRANSFORMER_PREDICTION_PATH, "static"
+
+
+def _prediction_file_metadata(path: Path, mode: str, pred: pd.DataFrame | None = None) -> dict[str, Any]:
+    metadata = {
+        "prediction_mode": mode,
+        "prediction_path": str(path),
+        "walk_forward_enabled": bool(TRANSFORMER_WALK_FORWARD_ENABLED),
+    }
+    if pred is None or pred.empty:
+        return metadata
+    if mode == "walk_forward":
+        metadata["leakage_guard"] = "train_valid_before_test"
+    if "fold_id" in pred.columns:
+        metadata["fold_count"] = int(pred["fold_id"].nunique())
+    if "test_start" in pred.columns:
+        years = pd.to_datetime(pred["test_start"], errors="coerce").dt.year.dropna()
+        if not years.empty:
+            metadata["first_test_year"] = int(years.min())
+            metadata["last_test_year"] = int(years.max())
+    return metadata
+
+
 def _transformer_prediction_series() -> pd.Series:
-    if not TRANSFORMER_PREDICTION_PATH.exists():
+    global LAST_TRANSFORMER_SIGNAL_METADATA
+    path, mode = _select_transformer_prediction_file()
+    LAST_TRANSFORMER_SIGNAL_METADATA = _prediction_file_metadata(path, mode)
+    if not path.exists():
         return pd.Series(dtype=float, name="score")
     try:
-        pred = pd.read_csv(TRANSFORMER_PREDICTION_PATH)
+        pred = pd.read_csv(path)
     except Exception as e:
         logger.warning("Failed to read transformer predictions: %s", e)
         return pd.Series(dtype=float, name="score")
     if pred.empty or "prediction" not in pred.columns:
         return pd.Series(dtype=float, name="score")
+    LAST_TRANSFORMER_SIGNAL_METADATA = _prediction_file_metadata(path, mode, pred)
     if {"date", "symbol"}.issubset(pred.columns):
         pred["datetime"] = pd.to_datetime(pred["date"], errors="coerce")
         pred["instrument"] = pred["symbol"].map(to_qlib_instrument)
@@ -230,20 +272,138 @@ def _transformer_prediction_series() -> pd.Series:
     ).sort_index()
 
 
+def _transformer_live_prediction_series() -> pd.Series:
+    global LAST_TRANSFORMER_SIGNAL_METADATA
+    prediction_dir = Path(TRANSFORMER_LIVE_PREDICTION_DIR)
+    paths = sorted(prediction_dir.glob("*.csv"))
+    LAST_TRANSFORMER_SIGNAL_METADATA = {
+        "prediction_mode": "live_snapshot",
+        "prediction_dir": str(prediction_dir),
+        "snapshot_day_count": 0,
+        "live_min_snapshot_days": int(TRANSFORMER_LIVE_MIN_SNAPSHOT_DAYS),
+    }
+    frames = []
+    for path in paths:
+        try:
+            df = pd.read_csv(path)
+        except Exception as e:
+            logger.warning("Failed to read live transformer snapshot %s: %s", path, e)
+            continue
+        if df.empty or "prediction" not in df.columns:
+            continue
+        if "date" not in df.columns:
+            df["date"] = path.stem
+        frames.append(df)
+    if not frames:
+        return pd.Series(dtype=float, name="score")
+
+    pred = pd.concat(frames, ignore_index=True)
+    if {"date", "symbol"}.issubset(pred.columns):
+        pred["datetime"] = pd.to_datetime(pred["date"], errors="coerce")
+        pred["instrument"] = pred["symbol"].map(to_qlib_instrument)
+    elif {"datetime", "instrument"}.issubset(pred.columns):
+        pred["datetime"] = pd.to_datetime(pred["datetime"], errors="coerce")
+        pred["instrument"] = pred["instrument"].astype(str).str.upper()
+    else:
+        return pd.Series(dtype=float, name="score")
+    pred = pred.dropna(subset=["datetime", "instrument"])
+    if pred.empty:
+        return pd.Series(dtype=float, name="score")
+    pred = pred.sort_values(["datetime", "instrument", "generated_at"] if "generated_at" in pred.columns else ["datetime", "instrument"])
+    pred = pred.drop_duplicates(["datetime", "instrument"], keep="last")
+    dates = pd.DatetimeIndex(pred["datetime"].dropna().unique()).sort_values()
+    LAST_TRANSFORMER_SIGNAL_METADATA = {
+        "prediction_mode": "live_snapshot",
+        "prediction_dir": str(prediction_dir),
+        "snapshot_day_count": int(len(dates)),
+        "first_snapshot_date": dates[0].date().isoformat() if len(dates) else None,
+        "last_snapshot_date": dates[-1].date().isoformat() if len(dates) else None,
+        "live_min_snapshot_days": int(TRANSFORMER_LIVE_MIN_SNAPSHOT_DAYS),
+    }
+    if len(dates) < int(TRANSFORMER_LIVE_MIN_SNAPSHOT_DAYS):
+        return pd.Series(dtype=float, name="score")
+    return pd.Series(
+        pd.to_numeric(pred["prediction"], errors="coerce").fillna(LOW_SIGNAL_SCORE).to_numpy(),
+        index=pd.MultiIndex.from_frame(pred[["instrument", "datetime"]]),
+        name="score",
+    ).sort_index()
+
+
+def _hybrid_signal(rule_signal: pd.Series, transformer_signal: pd.Series) -> pd.Series:
+    combined = pd.concat(
+        [rule_signal.rename("rule"), transformer_signal.rename("transformer")],
+        axis=1,
+    ).dropna()
+    if combined.empty:
+        return pd.Series(dtype=float, name="score")
+    rule = combined["rule"].where(combined["rule"] > LOW_SIGNAL_SCORE / 2, np.nan)
+    rule_z = (rule - rule.mean()) / rule.std() if rule.std() and not pd.isna(rule.std()) else rule * 0
+    transformer_z = (combined["transformer"] - combined["transformer"].mean()) / combined["transformer"].std()
+    transformer_z = transformer_z.replace([np.inf, -np.inf], 0).fillna(0)
+    return (rule_z.fillna(LOW_SIGNAL_SCORE) * 0.6 + transformer_z * 0.4).rename("score").sort_index()
+
+
+def _agent_signal_series() -> pd.Series:
+    records = []
+    paths = sorted(Path(AGENT_SIGNAL_DIR).glob("*.json"))
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("Failed to read agent signal snapshot %s: %s", path, e)
+            continue
+        snapshot_date = payload.get("date") or path.stem
+        trade_date = pd.to_datetime(snapshot_date, errors="coerce")
+        if pd.isna(trade_date):
+            continue
+        signals = payload.get("signals")
+        if signals is None and isinstance(payload, list):
+            signals = payload
+        if not isinstance(signals, list):
+            continue
+        for item in signals:
+            if not isinstance(item, dict):
+                continue
+            symbol = item.get("stock_code") or item.get("symbol")
+            if not symbol:
+                continue
+            action = str(item.get("action") or "hold").lower()
+            weight = pd.to_numeric(item.get("weight"), errors="coerce")
+            score = float(weight) if action == "buy" and pd.notna(weight) and float(weight) > 0 else LOW_SIGNAL_SCORE
+            records.append((to_qlib_instrument(str(symbol)), pd.Timestamp(trade_date), score))
+
+    if not records:
+        return pd.Series(dtype=float, name="score")
+    dates = {item[1] for item in records}
+    if len(dates) < 2:
+        return pd.Series(dtype=float, name="score")
+    return pd.Series(
+        [item[2] for item in records],
+        index=pd.MultiIndex.from_tuples(
+            [(item[0], item[1]) for item in records],
+            names=["instrument", "datetime"],
+        ),
+        name="score",
+    ).sort_index()
+
+
 def build_daily_signal_series(window: int = QLIB_BACKTEST_WINDOW, signal_source: str = "rule") -> pd.Series:
+    if signal_source == "agents":
+        return _agent_signal_series()
+
     frames = _read_factor_files()
     records = []
     for instrument, df in frames.items():
-        if "signal_score" not in df.columns:
+        score_column = "cross_section_score" if "cross_section_score" in df.columns else "signal_score"
+        if score_column not in df.columns:
             continue
         latest_dates = pd.DatetimeIndex(df["date"].dropna().sort_values().unique())[-window:]
         df = df[df["date"].isin(latest_dates)].copy()
-        signal_ok = (
-            df.get("signal", pd.Series(index=df.index, dtype=object)).astype(str).str.upper().eq("BUY")
-            & df.get("risk_flag", pd.Series(index=df.index, dtype=object)).astype(str).eq("normal")
-        )
-        rule_scores = pd.to_numeric(df["signal_score"], errors="coerce").where(signal_ok, LOW_SIGNAL_SCORE)
-        for trade_date, score in zip(df["date"], rule_scores):
+        rule_scores = pd.to_numeric(df[score_column], errors="coerce")
+        if "risk_flag" in df.columns:
+            normal_risk = df["risk_flag"].astype(str).eq("normal")
+            rule_scores = rule_scores.where(normal_risk, LOW_SIGNAL_SCORE)
+        for trade_date, score in zip(df["date"], rule_scores.fillna(LOW_SIGNAL_SCORE)):
             records.append((instrument, pd.Timestamp(trade_date), float(score)))
 
     if not records:
@@ -259,24 +419,21 @@ def build_daily_signal_series(window: int = QLIB_BACKTEST_WINDOW, signal_source:
     if signal_source == "rule":
         return rule_signal
 
+    if signal_source in {"transformer_live", "hybrid_live"}:
+        live_signal = _transformer_live_prediction_series()
+        if live_signal.empty:
+            return pd.Series(dtype=float, name="score")
+        if signal_source == "transformer_live":
+            return live_signal
+        return _hybrid_signal(rule_signal, live_signal)
+
     transformer_signal = _transformer_prediction_series()
     if transformer_signal.empty:
         return pd.Series(dtype=float, name="score")
     if signal_source == "transformer":
         return transformer_signal
     if signal_source == "hybrid":
-        combined = pd.concat(
-            [rule_signal.rename("rule"), transformer_signal.rename("transformer")],
-            axis=1,
-        ).dropna()
-        if combined.empty:
-            return pd.Series(dtype=float, name="score")
-        rule = combined["rule"].where(combined["rule"] > LOW_SIGNAL_SCORE / 2, np.nan)
-        rule_z = (rule - rule.mean()) / rule.std() if rule.std() and not pd.isna(rule.std()) else rule * 0
-        transformer_z = (combined["transformer"] - combined["transformer"].mean()) / combined["transformer"].std()
-        transformer_z = transformer_z.replace([np.inf, -np.inf], 0).fillna(0)
-        score = (rule_z.fillna(LOW_SIGNAL_SCORE) * 0.6 + transformer_z * 0.4).rename("score")
-        return score.sort_index()
+        return _hybrid_signal(rule_signal, transformer_signal)
     raise ValueError(f"Unsupported qlib signal_source: {signal_source}")
 
 
@@ -492,10 +649,24 @@ def _indicator_to_records(indicators: Any, limit: int = 10) -> list[dict]:
 
 def build_qlib_report_rows(qlib_report: dict[str, Any]) -> list[list[Any]]:
     if qlib_report.get("status") == "ok" and qlib_report.get("engine") == "qlib_comparison":
-        rows = [["mode", "comparison"]]
+        rows = [
+            ["mode", "comparison"],
+            ["prediction_mode", qlib_report.get("prediction_mode")],
+            ["walk_forward_enabled", qlib_report.get("walk_forward_enabled")],
+            ["leakage_guard", qlib_report.get("leakage_guard")],
+            ["fold_count", qlib_report.get("fold_count")],
+            ["first_test_year", qlib_report.get("first_test_year")],
+            ["last_test_year", qlib_report.get("last_test_year")],
+            ["snapshot_day_count", qlib_report.get("snapshot_day_count")],
+            ["first_snapshot_date", qlib_report.get("first_snapshot_date")],
+            ["last_snapshot_date", qlib_report.get("last_snapshot_date")],
+            ["live_min_snapshot_days", qlib_report.get("live_min_snapshot_days")],
+        ]
         for source, report in qlib_report.get("signal_reports", {}).items():
             rows.extend(
                 [
+                    [f"{source}_status", report.get("status")],
+                    [f"{source}_reason", report.get("reason", "")],
                     [f"{source}_total_return", _fmt_percent(report.get("total_return_percent"))],
                     [f"{source}_max_drawdown", _fmt_percent(report.get("max_drawdown_percent"))],
                     [f"{source}_sharpe", report.get("sharpe")],
@@ -530,7 +701,49 @@ def _save_qlib_report(report: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
-def _run_single_qlib_backtest(signal_source: str = "rule") -> dict[str, Any]:
+def _portfolio_topk(signal: pd.Series) -> int:
+    dates = signal.index.get_level_values("datetime")
+    latest_date = dates.max()
+    count = int((dates == latest_date).sum())
+    return max(1, int(round(count * float(LONG_QUANTILE))))
+
+
+def _apply_rebalance_frequency(signal: pd.Series, frequency: str) -> pd.Series:
+    if frequency == "daily" or signal.empty:
+        return signal
+    frame = signal.rename("score").reset_index()
+    frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
+    frame = frame.dropna(subset=["datetime"]).sort_values(["datetime", "instrument"])
+    if frame.empty:
+        return signal
+    dates = pd.DatetimeIndex(frame["datetime"].drop_duplicates().sort_values())
+    if frequency == "weekly":
+        periods = dates.to_period("W")
+    elif frequency == "monthly":
+        periods = dates.to_period("M")
+    else:
+        raise ValueError(f"Unsupported rebalance_frequency: {frequency}")
+    rebalance_dates = []
+    seen = set()
+    for date, period in zip(dates, periods):
+        if period in seen:
+            continue
+        seen.add(period)
+        rebalance_dates.append(date)
+    pivot = frame.pivot_table(index="datetime", columns="instrument", values="score", aggfunc="last")
+    pivot = pivot.reindex(dates)
+    rebalanced = pivot.loc[rebalance_dates].reindex(dates).ffill()
+    out = rebalanced.stack(dropna=True).rename("score")
+    out.index = out.index.set_names(["datetime", "instrument"])
+    return out.reorder_levels(["instrument", "datetime"]).sort_index()
+
+
+def _run_single_qlib_backtest(
+    signal_source: str = "rule",
+    rebalance_frequency: str = "daily",
+    cost_profile: str = "current",
+    save_report: bool = True,
+) -> dict[str, Any]:
     if not QLIB_ENABLED:
         return {"status": "skipped", "reason": "QLIB_ENABLED is False"}
 
@@ -549,7 +762,18 @@ def _run_single_qlib_backtest(signal_source: str = "rule") -> dict[str, Any]:
 
     signal = build_daily_signal_series(signal_source=signal_source)
     if signal.empty:
-        return {"status": "skipped", "reason": f"empty daily qlib signal for {signal_source}", "signal_source": signal_source}
+        result = {"status": "skipped", "reason": f"empty daily qlib signal for {signal_source}", "signal_source": signal_source}
+        if signal_source in {"transformer_live", "hybrid_live"}:
+            result.update(LAST_TRANSFORMER_SIGNAL_METADATA)
+            result["reason"] = (
+                f"not enough live transformer prediction snapshots "
+                f"({LAST_TRANSFORMER_SIGNAL_METADATA.get('snapshot_day_count', 0)}/"
+                f"{TRANSFORMER_LIVE_MIN_SNAPSHOT_DAYS})"
+            )
+        return result
+    signal = _apply_rebalance_frequency(signal, rebalance_frequency)
+    topk = _portfolio_topk(signal)
+    costs = QLIB_COST_PROFILES.get(cost_profile, QLIB_COST_PROFILES["current"])
 
     dates = signal.index.get_level_values("datetime").unique().sort_values()
     if len(dates) < 2:
@@ -563,8 +787,8 @@ def _run_single_qlib_backtest(signal_source: str = "rule") -> dict[str, Any]:
         qlib.init(provider_uri=str(QLIB_PROVIDER_URI), region=REG_CN, skip_if_reg=False)
         strategy = TopkDropoutStrategy(
             signal=signal,
-            topk=TOP_N,
-            n_drop=TOP_N,
+            topk=topk,
+            n_drop=topk,
             risk_degree=MAX_TOTAL_POSITION,
             only_tradable=False,
             forbid_all_trade_at_limit=False,
@@ -584,16 +808,22 @@ def _run_single_qlib_backtest(signal_source: str = "rule") -> dict[str, Any]:
             exchange_kwargs={
                 "freq": "day",
                 "deal_price": "close",
-                "open_cost": QLIB_OPEN_COST,
-                "close_cost": QLIB_CLOSE_COST,
-                "min_cost": QLIB_MIN_COST,
+                "open_cost": costs["open_cost"],
+                "close_cost": costs["close_cost"],
+                "min_cost": costs["min_cost"],
                 "limit_threshold": None,
                 "trade_unit": None,
             },
         )
         result = summarize_qlib_backtest(report, None, indicators, data_info)
         result["signal_source"] = signal_source
-        return _save_qlib_report(result)
+        result["rebalance_frequency"] = rebalance_frequency
+        result["cost_profile"] = cost_profile
+        result["costs"] = costs
+        result["topk"] = topk
+        if signal_source in {"transformer", "hybrid", "transformer_live", "hybrid_live"}:
+            result.update(LAST_TRANSFORMER_SIGNAL_METADATA)
+        return _save_qlib_report(result) if save_report else result
     except Exception as e:
         logger.exception("Qlib backtest failed: %s", e)
         return {
@@ -602,7 +832,39 @@ def _run_single_qlib_backtest(signal_source: str = "rule") -> dict[str, Any]:
             "engine": "qlib",
             "signal_source": signal_source,
             "provider_uri": str(QLIB_PROVIDER_URI),
+            "rebalance_frequency": rebalance_frequency,
+            "cost_profile": cost_profile,
         }
+
+
+def run_rebalance_cost_comparison(signal_source: str = "rule") -> list[dict[str, Any]]:
+    rows = []
+    for frequency in QLIB_REBALANCE_FREQUENCIES:
+        for profile in ["low", "current", "high"]:
+            report = _run_single_qlib_backtest(
+                signal_source=signal_source,
+                rebalance_frequency=frequency,
+                cost_profile=profile,
+                save_report=False,
+            )
+            rows.append(
+                {
+                    "signal_source": signal_source,
+                    "rebalance_frequency": frequency,
+                    "cost_profile": profile,
+                    "status": report.get("status"),
+                    "reason": report.get("reason"),
+                    "total_return_percent": report.get("total_return_percent"),
+                    "annualized_return_percent": report.get("annualized_return_percent"),
+                    "max_drawdown_percent": report.get("max_drawdown_percent"),
+                    "sharpe": report.get("sharpe"),
+                    "turnover_rate": report.get("turnover_rate"),
+                    "benchmark_comparison": report.get("benchmark_comparison"),
+                    "costs": report.get("costs"),
+                    "topk": report.get("topk"),
+                }
+            )
+    return rows
 
 
 def run_qlib_backtest(signal_source: str = "comparison") -> dict[str, Any]:
@@ -611,7 +873,7 @@ def run_qlib_backtest(signal_source: str = "comparison") -> dict[str, Any]:
 
     reports = {
         source: _run_single_qlib_backtest(source)
-        for source in ["rule", "transformer", "hybrid"]
+        for source in ["rule", "transformer", "hybrid", "transformer_live", "hybrid_live", "agents"]
     }
     ok_reports = {source: report for source, report in reports.items() if report.get("status") == "ok"}
     if not ok_reports:
@@ -625,7 +887,12 @@ def run_qlib_backtest(signal_source: str = "comparison") -> dict[str, Any]:
         "status": "ok",
         "engine": "qlib_comparison",
         "signal_reports": reports,
-        "primary_signal_source": "hybrid" if reports.get("hybrid", {}).get("status") == "ok" else "rule",
+        "primary_signal_source": "hybrid_live"
+        if reports.get("hybrid_live", {}).get("status") == "ok"
+        else "hybrid"
+        if reports.get("hybrid", {}).get("status") == "ok"
+        else "rule",
+        "rebalance_cost_comparison": run_rebalance_cost_comparison("rule"),
     }
     primary = reports.get(report["primary_signal_source"], {})
     for key in [
@@ -644,6 +911,18 @@ def run_qlib_backtest(signal_source: str = "comparison") -> dict[str, Any]:
         "positions",
         "trade_records",
         "benchmark_comparison",
+        "prediction_mode",
+        "prediction_path",
+        "prediction_dir",
+        "walk_forward_enabled",
+        "leakage_guard",
+        "fold_count",
+        "first_test_year",
+        "last_test_year",
+        "snapshot_day_count",
+        "first_snapshot_date",
+        "last_snapshot_date",
+        "live_min_snapshot_days",
     ]:
         if key in primary:
             report[key] = primary[key]

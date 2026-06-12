@@ -56,7 +56,7 @@ def _execution_result(
 def execute_final_orders(final_orders: list[Any]) -> dict[str, Any]:
     """Write final orders for the GM terminal runner.
 
-    Even when there is no valid buy order, this function writes an empty
+    Even when there is no valid trading order, this function writes an empty
     ``gm_orders.json`` so the GM side can distinguish "no trade today" from
     "the pipeline did not run or the file path is wrong".
     """
@@ -75,7 +75,9 @@ def execute_final_orders(final_orders: list[Any]) -> dict[str, Any]:
         stock_code = str(getattr(order, "stock_code", "") or "")
         quantity_pct = float(getattr(order, "quantity_percent", 0) or 0)
 
-        if direction != "buy" or quantity_pct <= 0:
+        if direction == "buy" and quantity_pct <= 0:
+            continue
+        if direction not in {"buy", "sell"}:
             continue
 
         orders_data.append(
@@ -88,12 +90,12 @@ def execute_final_orders(final_orders: list[Any]) -> dict[str, Any]:
         )
 
     if not orders_data:
-        payload = _write_orders_payload([], "skipped", "no valid buy instructions")
+        payload = _write_orders_payload([], "skipped", "no valid trading instructions")
         logger.info("GM empty order file written: %s", ORDERS_PATH)
         return _execution_result(payload, submitted_count=0, skipped_count=len(final_orders))
 
     payload = _write_orders_payload(orders_data, "ok", "orders generated")
-    logger.info("GM order file written: %s (%s buy orders)", ORDERS_PATH, len(orders_data))
+    logger.info("GM order file written: %s (%s orders)", ORDERS_PATH, len(orders_data))
     return _execution_result(
         payload,
         submitted_count=len(orders_data),

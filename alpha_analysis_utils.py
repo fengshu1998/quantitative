@@ -13,6 +13,7 @@ from config import (
     ALPHA_FACTOR_SELECTION_PATH,
     ALPHA_REPORT_DIR,
     FACTOR_DATA_DIR,
+    LIVE_FACTOR_FEEDBACK_PATH,
 )
 
 
@@ -120,6 +121,7 @@ def _factor_stats(panel: pd.DataFrame) -> list[dict[str, Any]]:
                     "ic_ir": None,
                     "rank_ic_ir": None,
                     "long_short_return": None,
+                    "top20_bottom20_return": None,
                 }
             )
             continue
@@ -155,6 +157,7 @@ def _factor_stats(panel: pd.DataFrame) -> list[dict[str, Any]]:
                 "ic_ir": _round_or_none(_safe_ir(ic_mean, ic_std)),
                 "rank_ic_ir": _round_or_none(_safe_ir(rank_ic_mean, rank_ic_std)),
                 "long_short_return": _round_or_none(np.nanmean(quantile_returns) if quantile_returns else None),
+                "top20_bottom20_return": _round_or_none(np.nanmean(quantile_returns) if quantile_returns else None),
             }
         )
     return rows
@@ -264,7 +267,34 @@ def _weight_from_stats(row: dict[str, Any], validity: str, penalty: float) -> tu
     return level, round(max(weight * (1 - penalty), 0.0), 6)
 
 
-def build_factor_selection(factor_stats: list[dict[str, Any]], corr: pd.DataFrame | None = None) -> list[dict[str, Any]]:
+def _load_live_factor_feedback() -> dict[str, Any]:
+    if not LIVE_FACTOR_FEEDBACK_PATH.exists():
+        return {}
+    try:
+        return json.loads(LIVE_FACTOR_FEEDBACK_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Failed to load live factor feedback: %s", e)
+        return {}
+
+
+def _apply_live_feedback(
+    factor: str,
+    factor_weight: float,
+    feedback: dict[str, Any],
+) -> tuple[float, float]:
+    factors = (feedback or {}).get("factors") or {}
+    meta = factors.get(factor) or {}
+    multiplier = float(meta.get("feedback_multiplier", 1.0) or 1.0)
+    multiplier = max(0.5, min(1.5, multiplier))
+    adjusted = max(0.0, min(2.0, factor_weight * multiplier))
+    return round(adjusted, 6), round(multiplier, 6)
+
+
+def build_factor_selection(
+    factor_stats: list[dict[str, Any]],
+    corr: pd.DataFrame | None = None,
+    live_feedback: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     corr = corr if corr is not None else pd.DataFrame()
     selections = []
     for row in factor_stats:
@@ -272,6 +302,10 @@ def build_factor_selection(factor_stats: list[dict[str, Any]], corr: pd.DataFram
         validity = _validity_from_stats(row, direction)
         penalty = _correlation_penalty(row["factor"], corr)
         weight_level, factor_weight = _weight_from_stats(row, validity, penalty)
+        base_factor_weight = factor_weight
+        feedback_multiplier = 1.0
+        if live_feedback:
+            factor_weight, feedback_multiplier = _apply_live_feedback(row["factor"], factor_weight, live_feedback)
         selections.append(
             {
                 **row,
@@ -279,6 +313,8 @@ def build_factor_selection(factor_stats: list[dict[str, Any]], corr: pd.DataFram
                 "direction": direction,
                 "weight_level": weight_level,
                 "correlation_penalty": penalty,
+                "base_factor_weight": base_factor_weight,
+                "feedback_multiplier": feedback_multiplier,
                 "factor_weight": factor_weight,
                 "signal_weight": factor_weight,
             }
@@ -295,18 +331,19 @@ def build_alpha_summary_markdown(report: dict[str, Any]) -> str:
         f"- date_count: {report.get('date_count')}",
         f"- instrument_count: {report.get('instrument_count')}",
         "",
-        "| factor | IC | RankIC | IC_IR | RankIC_IR | Long-Short | Missing | Samples |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| factor | IC | RankIC | IC_IR | RankIC_IR | Long-Short | Top20-Bottom20 | Missing | Samples |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in report.get("factor_stats", []):
         lines.append(
-            "| {factor} | {ic} | {rank_ic} | {ic_ir} | {rank_ic_ir} | {ls} | {miss} | {n} |".format(
+            "| {factor} | {ic} | {rank_ic} | {ic_ir} | {rank_ic_ir} | {ls} | {top20} | {miss} | {n} |".format(
                 factor=row["factor"],
                 ic=row["ic"],
                 rank_ic=row["rank_ic"],
                 ic_ir=row["ic_ir"],
                 rank_ic_ir=row["rank_ic_ir"],
                 ls=row["long_short_return"],
+                top20=row.get("top20_bottom20_return"),
                 miss=row["missing_rate"],
                 n=row["sample_count"],
             )
@@ -342,7 +379,7 @@ def build_alpha_summary_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run_alpha_analysis() -> dict[str, Any]:
+def run_alpha_analysis(apply_live_feedback: bool = True) -> dict[str, Any]:
     if not ALPHA_ANALYSIS_ENABLED:
         return {"status": "skipped", "reason": "ALPHA_ANALYSIS_ENABLED is False"}
 
@@ -357,7 +394,8 @@ def run_alpha_analysis() -> dict[str, Any]:
     ALPHA_REPORT_DIR.mkdir(parents=True, exist_ok=True)
     factor_stats = _factor_stats(panel)
     corr = _factor_correlation(panel)
-    factor_selection = build_factor_selection(factor_stats, corr)
+    live_feedback = _load_live_factor_feedback() if apply_live_feedback else {}
+    factor_selection = build_factor_selection(factor_stats, corr, live_feedback)
     report = {
         "status": "ok",
         "sample_count": int(len(panel)),
@@ -367,6 +405,8 @@ def run_alpha_analysis() -> dict[str, Any]:
         "factor_stats": factor_stats,
         "factor_selection": factor_selection,
         "factor_correlation": _factor_correlation_json(corr),
+        "live_feedback_applied": bool(live_feedback),
+        "live_feedback_path": str(LIVE_FACTOR_FEEDBACK_PATH),
         "json_path": str(ALPHA_REPORT_DIR / "alpha_summary.json"),
         "markdown_path": str(ALPHA_REPORT_DIR / "alpha_summary.md"),
         "factor_selection_path": str(ALPHA_FACTOR_SELECTION_PATH),

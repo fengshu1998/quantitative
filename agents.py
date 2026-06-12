@@ -9,6 +9,7 @@ from tradingagents_graph_runner import (
     map_tradingagents_to_stock_recommendation,
     run_tradingagents_for_candidate,
     run_tradingagents_research,
+    save_agent_signal_snapshot,
 )
 
 
@@ -21,4 +22,5 @@ __all__ = [
     "map_tradingagents_to_stock_recommendation",
     "run_tradingagents_for_candidate",
     "run_tradingagents_research",
+    "save_agent_signal_snapshot",
 ]

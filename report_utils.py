@@ -2,6 +2,9 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
+
+from config import SELECTED_CANDIDATES_PATH
 from qlib_backtest_utils import build_qlib_report_rows
 
 
@@ -38,21 +41,6 @@ def _markdown_table(headers, rows):
     return "\n".join(lines)
 
 
-def _backtest_rows(backtest_report):
-    if backtest_report.get("status") != "ok":
-        return [["status", backtest_report.get("status", "unknown")], ["reason", backtest_report.get("reason", "")]]
-
-    return [
-        ["backtest_window", f"{backtest_report['start_date']} to {backtest_report['end_date']}"],
-        ["trading_days", backtest_report["trading_days"]],
-        ["total_return", _format_percent(backtest_report["total_return_percent"])],
-        ["annualized_return", _format_percent(backtest_report["annualized_return_percent"])],
-        ["annualized_volatility", _format_percent(backtest_report["annualized_volatility_percent"])],
-        ["sharpe", backtest_report["sharpe"]],
-        ["max_drawdown", _format_percent(backtest_report["max_drawdown_percent"])],
-    ]
-
-
 def _alpha_factor_selection_rows(alpha_report):
     rows = []
     for item in alpha_report.get("factor_selection", []):
@@ -70,6 +58,36 @@ def _alpha_factor_selection_rows(alpha_report):
     if not rows:
         rows = [["None", "None", "None", "0", "0", "None", "None"]]
     return rows
+
+
+def _load_selected_candidates_for_report():
+    if not SELECTED_CANDIDATES_PATH.exists():
+        return []
+    try:
+        df = pd.read_csv(SELECTED_CANDIDATES_PATH)
+    except Exception:
+        return []
+    if df.empty:
+        return []
+    columns = [
+        "symbol",
+        "name",
+        "signal",
+        "cross_section_score",
+        "cross_section_rank_pct",
+        "alpha_cross_section_score",
+        "transformer_cross_section_score",
+        "risk_liquidity_cross_section_score",
+        "alpha_score",
+        "transformer_score",
+        "risk_liquidity_score",
+        "benchmark_weight",
+        "benchmark_weight_source",
+        "target_weight",
+        "signal_reason",
+    ]
+    existing_columns = [column for column in columns if column in df.columns]
+    return df[existing_columns].head(20).to_dict(orient="records")
 
 
 def build_report_payload(market_summary, messages, agent_outputs, portfolio_result, generated_at):
@@ -93,15 +111,26 @@ def build_report_payload(market_summary, messages, agent_outputs, portfolio_resu
         "alpha_analysis_report",
         {"status": "skipped", "reason": "not available"},
     )
+    live_attribution_report = getattr(
+        portfolio_result,
+        "live_attribution_report",
+        {"status": "skipped", "reason": "not available"},
+    )
+    agent_feedback_report = getattr(
+        portfolio_result,
+        "agent_feedback_report",
+        {"status": "skipped", "reason": "not available"},
+    )
     return {
         "run_id": generated_at.strftime("%Y%m%d_%H%M%S"),
         "generated_at": generated_at.isoformat(timespec="seconds"),
         "market_summary": market_summary,
         "market_state": agent_outputs.macro.model_dump(),
         "stock_signals": [item.model_dump() for item in agent_outputs.stocks],
+        "selected_candidates": _load_selected_candidates_for_report(),
         "model_risk": agent_outputs.model_risk.model_dump(),
+        "agent_signal_snapshot": getattr(agent_outputs, "agent_signal_snapshot", {}),
         "deterministic_risk": portfolio_result.risk.model_dump(),
-        "backtest_report": portfolio_result.backtest_report,
         "qlib_backtest_report": qlib_report,
         "qlib_positions": qlib_report.get("positions", []),
         "qlib_trade_records": qlib_report.get("trade_records", []),
@@ -109,6 +138,8 @@ def build_report_payload(market_summary, messages, agent_outputs, portfolio_resu
         "transformer_training_report": transformer_report,
         "transformer_inference_report": transformer_inference_report,
         "alpha_analysis_report": alpha_report,
+        "live_attribution_report": live_attribution_report,
+        "agent_feedback_report": agent_feedback_report,
         "llm_explanation": {
             "macro": agent_outputs.macro.reason,
             "stocks": [
@@ -155,6 +186,9 @@ def _strategy_validation_rows(strategy_validation):
     strategy_validation = strategy_validation or {}
     return [
         ["validation_available", strategy_validation.get("validation_available")],
+        ["validation_signal_scope", strategy_validation.get("validation_signal_scope")],
+        ["transformer_validation_source", strategy_validation.get("transformer_validation_source")],
+        ["hybrid_validation_source", strategy_validation.get("hybrid_validation_source")],
         ["rule_backtest_support", strategy_validation.get("rule_backtest_support")],
         ["transformer_backtest_support", strategy_validation.get("transformer_backtest_support")],
         ["hybrid_improvement", strategy_validation.get("hybrid_improvement")],
@@ -245,11 +279,13 @@ def render_markdown_report(payload):
     market_state = payload["market_state"]
     stock_signals = payload["stock_signals"]
     risk_result = payload["deterministic_risk"]
-    backtest_report = payload["backtest_report"]
     qlib_backtest_report = payload.get("qlib_backtest_report", {})
     transformer_report = payload.get("transformer_training_report", {})
     transformer_inference_report = payload.get("transformer_inference_report", {})
     alpha_report = payload.get("alpha_analysis_report", {})
+    live_attribution_report = payload.get("live_attribution_report", {})
+    agent_feedback_report = payload.get("agent_feedback_report", {})
+    selected_candidates = payload.get("selected_candidates", [])
     llm_explanation = payload["llm_explanation"]
 
     stock_rows = [
@@ -263,6 +299,24 @@ def render_markdown_report(payload):
     ]
     if not stock_rows:
         stock_rows = [["None", "None", "0.00%", "No stock signal generated"]]
+
+    candidate_rows = [
+        [
+            item.get("symbol"),
+            item.get("name", ""),
+            item.get("signal"),
+            item.get("cross_section_score"),
+            item.get("cross_section_rank_pct"),
+            _format_percent(float(item.get("benchmark_weight", 0) or 0) * 100),
+            item.get("alpha_cross_section_score"),
+            item.get("transformer_cross_section_score"),
+            item.get("risk_liquidity_cross_section_score"),
+            _format_percent(float(item.get("target_weight", 0) or 0) * 100),
+        ]
+        for item in selected_candidates
+    ]
+    if not candidate_rows:
+        candidate_rows = [["None", "", "None", "0", "0", "0.00%", "0", "0", "0", "0.00%"]]
 
     order_rows = [
         [
@@ -296,14 +350,17 @@ def render_markdown_report(payload):
         "```",
         "## Stock Signals",
         _markdown_table(["Stock", "Action", "Suggested Weight", "Reason"], stock_rows),
+        "## Cross-Section Signal Candidates",
+        _markdown_table(
+            ["Stock", "Name", "Signal", "CS Score", "RankPct", "Benchmark Weight", "Alpha CS", "Transformer CS", "Risk/Liquidity CS", "Target Weight"],
+            candidate_rows,
+        ),
         "## Deterministic Risk Result",
         f"- Approved: {risk_result['approved']}",
         "- Rule adjustments:",
         "\n".join(f"  - {item}" for item in rule_adjustments),
         "### Final Orders",
         _markdown_table(["Stock", "Direction", "Weight", "Stop Loss"], order_rows),
-        "## Lightweight Backtest",
-        _markdown_table(["Metric", "Value"], _backtest_rows(backtest_report)),
         "## Qlib Professional Backtest",
         _markdown_table(["Metric", "Value"], build_qlib_report_rows(qlib_backtest_report)),
         "### Qlib Positions",
@@ -358,6 +415,40 @@ def render_markdown_report(payload):
             ["Factor", "Validity", "Direction", "Weight", "Signal Weight", "RankIC", "Long-Short"],
             _alpha_factor_selection_rows(alpha_report),
         ),
+        "## Live Attribution Feedback",
+        _markdown_table(
+            ["Metric", "Value"],
+            [
+                ["status", live_attribution_report.get("status")],
+                ["reason", live_attribution_report.get("reason")],
+                ["attribution_path", live_attribution_report.get("attribution_path")],
+                ["source_generated_at", live_attribution_report.get("source_generated_at")],
+            ],
+        ),
+        "## Agents Backtest Feedback",
+        _markdown_table(
+            ["Metric", "Value"],
+            [
+                ["status", agent_feedback_report.get("status")],
+                ["reason", agent_feedback_report.get("reason")],
+                ["agent_total_return", agent_feedback_report.get("agent_total_return_percent")],
+                ["hybrid_total_return", agent_feedback_report.get("hybrid_total_return_percent")],
+                ["agent_excess_vs_hybrid", agent_feedback_report.get("agent_excess_vs_hybrid_percent")],
+                ["agent_max_drawdown", agent_feedback_report.get("agent_max_drawdown_percent")],
+                ["hybrid_max_drawdown", agent_feedback_report.get("hybrid_max_drawdown_percent")],
+                ["agent_sharpe", agent_feedback_report.get("agent_sharpe")],
+                ["hybrid_sharpe", agent_feedback_report.get("hybrid_sharpe")],
+                ["feedback_path", agent_feedback_report.get("feedback_path")],
+            ],
+        ),
+        "```json",
+        _json_block(
+            {
+                "feedback_summary": agent_feedback_report.get("feedback_summary"),
+                "recommended_constraints": agent_feedback_report.get("recommended_constraints", []),
+            }
+        ),
+        "```",
         "## LLM Explanation",
         f"- Macro: {_safe_text(llm_explanation['macro'])}",
         "### Stocks",

@@ -1,6 +1,6 @@
 import math
 
-from config import LOOKBACK_DAYS, TOP_N, UNIVERSE_INDEX
+from config import LONG_QUANTILE, LOOKBACK_DAYS, UNIVERSE_INDEX
 
 
 def _is_missing(value):
@@ -58,7 +58,7 @@ def _candidate_line(candidate, rank):
     return (
         f"{rank}. {candidate['symbol']} {candidate['name']} | "
         f"行业={candidate.get('industry') or 'N/A'} | "
-        f"signal={candidate['signal']} | score={candidate['signal_score']} | "
+        f"signal={candidate['signal']} | cross_section_score={candidate.get('cross_section_score')} | "
         f"target_weight={format_weight(candidate.get('target_weight'))} | "
         f"20日收益={format_factor_percent(candidate.get('return_20d'))} | "
         f"20日波动率={format_factor_percent(candidate.get('volatility_20d'))} | "
@@ -108,7 +108,7 @@ def build_market_summary(
         "三、行业分布",
         f"- 有效股票行业分布 Top10：{top_industry_text}",
         "",
-        f"四、最终候选股票 TOP {TOP_N}",
+        f"四、最终指数增强候选股票（前{int(float(LONG_QUANTILE) * 100)}%）",
     ]
 
     if selected_candidates:
